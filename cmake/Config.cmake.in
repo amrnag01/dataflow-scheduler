@@ -1,11 +1,19 @@
 @PACKAGE_INIT@
 
-find_package(KTIR REQUIRED 
+find_package(KTIR REQUIRED
   HINTS ${CMAKE_CURRENT_LIST_DIR}/../KTIR
 )
-find_package(DataflowSchedulerDialects REQUIRED 
+find_package(DataflowSchedulerDialects REQUIRED
   HINTS ${CMAKE_CURRENT_LIST_DIR}/../DataflowSchedulerDialects
 )
+find_package(CURL REQUIRED)
+
+# Find nlohmann_json for internal use
+include(FetchContent)
+FetchContent_Declare(json
+  URL https://github.com/nlohmann/json/releases/download/v3.11.2/json.tar.xz
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(json)
 
 #
 # Exported targets

@@ -181,15 +181,13 @@ def TileSizeSelectionPass : Pass<"tile-size-selection", "mlir::ModuleOp"> {
   let summary = "Resolve ktdf.tiling.reserve_size placeholders to concrete constants";
   let description = [{
     This pass analyzes each ktdf.tiling.reserve_size op to discover which scf.for
-    loops it is used to tile and uses the loop trip count and other information 
+    loops it is used to tile and uses the loop trip count and other information
     (eg. in future L1 usage) to replace the placeholder with an actual tile size.
 
-    Unresolved placeholders are tracked and reported with clear debug messages so
-    future post-processing can apply a fallback policy if desired.
+    This pass requires a SchedulerExtContext for agent-driven tile size optimization.
   }];
-  let constructor = "::mlir::ktdf::createTileSizeSelectionPass()";
   let dependentDialects = [
-      "mlir::ktdf::KTDFDialect", 
+      "mlir::ktdf::KTDFDialect",
       "mlir::scf::SCFDialect",
       "mlir::arith::ArithDialect"];
 }
