@@ -32,6 +32,10 @@ class Pass;
 class OpPassManager;
 }  // namespace mlir
 
+namespace scheduler {
+struct SchedulerExtContext;
+}  // namespace scheduler
+
 namespace mlir::ktdf {
 
 auto createBroadcastPromotionPass() -> std::unique_ptr<Pass>;
@@ -44,7 +48,8 @@ auto createStageCoarseningPass() -> std::unique_ptr<Pass>;
 
 auto createSubsumeLinearizeIndexPass() -> std::unique_ptr<Pass>;
 
-auto createTileSizeSelectionPass() -> std::unique_ptr<Pass>;
+auto createTileSizeSelectionPass(
+    const scheduler::SchedulerExtContext& scheduler_ctx) -> std::unique_ptr<Pass>;
 
 #define GEN_PASS_DECL
 #define GEN_PASS_REGISTRATION

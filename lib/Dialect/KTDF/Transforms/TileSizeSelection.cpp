@@ -27,7 +27,10 @@
 
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
+#include "dataflow-scheduler/Dialect/KTDF/TileSizeInfo.h"
 #include "dataflow-scheduler/Transforms/Utils/Utils.h"
+#include "dataflow-scheduler/Utils/SchedulerExtContext.h"
+#include "dataflow-scheduler/Utils/TileSizeAgentInterface.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/DebugLog.h"
@@ -42,6 +45,7 @@
 #define DEBUG_TYPE PASS_NAME
 
 using namespace mlir;
+using namespace scheduler;
 
 namespace mlir::ktdf {
 #define GEN_PASS_DEF_TILESIZESELECTIONPASS
@@ -50,23 +54,6 @@ namespace mlir::ktdf {
 
 namespace {
 
-// TODO: should use much large size when proper L1 usage analysis is available.
-constexpr int64_t kMaxCandidateTileSize = 2;
-
-struct AssociatedLoopInfo {
-  scf::ForOp loop;
-
-  // The total size being tiled (numerator in ceildiv operation).
-  // For pattern: %bound = arith.ceildivui %total_size, %tile_size
-  // This represents %total_size which must be evenly divisible by the tile
-  // size.
-  int64_t total_size;
-};
-
-struct TileSizeInfo {
-  ktdf::TilingReserveSizeOp reserve_size_op;
-  SmallVector<AssociatedLoopInfo> associated_loops;
-};
 
 void logUnresolved(ktdf::TilingReserveSizeOp reserve_size_op,
                    llvm::StringRef reason) {
@@ -120,66 +107,41 @@ void collectAssociatedLoops(
   }
 }
 
-enum class TileSizeValidity {
-  // Candidate tile size is valid for all loops
-  kValidForAllLoops,
-  // Invalid for this candidate tile size.
-  kInvalidForThisTileSize,
-};
 
-TileSizeValidity evaluateCandidateTileSize(const TileSizeInfo& ts_info,
-                                           int64_t candidate) {
-  for (const AssociatedLoopInfo& loop_info : ts_info.associated_loops) {
-    // Check if the total size is evenly divisible by the candidate tile size
-    if (loop_info.total_size % candidate != 0) {
-      return TileSizeValidity::kInvalidForThisTileSize;
-    }
-  }
-
-  return TileSizeValidity::kValidForAllLoops;
-}
-
-std::optional<int64_t> chooseTileSize(
+int64_t chooseTileSizeViaAgent(
+    mlir::ModuleOp module,
     TileSizeInfo& ts_info,
-    SmallVectorImpl<ktdf::TilingReserveSizeOp>& unresolved_ops) {
-  const int64_t min_value =
+    SchedulerExtContext& scheduler_ctx) {
+  int64_t min_value =
       ts_info.reserve_size_op.getMinValue().getSExtValue();
-  const int64_t divisibility =
+  int64_t divisibility =
       ts_info.reserve_size_op.getDivisibility().getSExtValue();
 
-  if (ts_info.associated_loops.empty()) {
-    logUnresolved(ts_info.reserve_size_op,
-                  "no associated loops found via ceildivui pattern");
-    unresolved_ops.push_back(ts_info.reserve_size_op);
-    return std::nullopt;
+  int64_t selected_tile_size =
+      scheduler_ctx.selectTileSize(module, ts_info);
+
+  if (!validateTileSizeResult(selected_tile_size, ts_info, min_value,
+                              divisibility)) {
+    llvm::report_fatal_error(
+        llvm::Twine("Agent produced invalid tile size: ") +
+        llvm::Twine(selected_tile_size));
   }
 
-  const int64_t start_candidate =
-      std::max<int64_t>(kMaxCandidateTileSize, min_value);
-  for (int64_t candidate = start_candidate; candidate >= min_value;
-       --candidate) {
-    LLVM_DEBUG({
-      if (candidate <= 1) {
-        llvm::dbgs() << "[" PASS_NAME
-                     << "] no suitable tile size greater than one for "
-                        "tiling.reserve_size at "
-                     << ts_info.reserve_size_op.getLoc() << ".\n";
-      }
-    });
-    if (divisibility > 1 && candidate % divisibility != 0) continue;
-    TileSizeValidity eval = evaluateCandidateTileSize(ts_info, candidate);
-    if (eval == TileSizeValidity::kValidForAllLoops) return candidate;
-  }
-  // At the very least a tile size of 1 should have been chosen.
-  llvm_unreachable("unresolved tile size");
-  return std::nullopt;
+  return selected_tile_size;
 }
 
 struct TileSizeSelectionPass
     : public ktdf::impl::TileSizeSelectionPassBase<TileSizeSelectionPass> {
+  const SchedulerExtContext* scheduler_ctx = nullptr;
+
   void runOnOperation() override {
     LDBG(1) << "========= " PASS_NAME " =========";
     ModuleOp module = getOperation();
+
+    if (!scheduler_ctx) {
+      llvm::report_fatal_error(
+          "TileSizeSelectionPass requires SchedulerExtContext");
+    }
 
     SmallVector<ktdf::TilingReserveSizeOp> reserve_size_ops;
     module.walk([&](ktdf::TilingReserveSizeOp reserve_size_op) {
@@ -201,31 +163,24 @@ struct TileSizeSelectionPass
 
     OpBuilder builder(module.getContext());
     for (TileSizeInfo& ts_info : analyses) {
-      std::optional<int64_t> chosen_tile_size =
-          chooseTileSize(ts_info, unresolved_ops);
-      if (!chosen_tile_size.has_value()) {
-        continue;
-      }
+      int64_t chosen_tile_size =
+          chooseTileSizeViaAgent(module, ts_info, const_cast<SchedulerExtContext&>(*scheduler_ctx));
 
       builder.setInsertionPoint(ts_info.reserve_size_op);
       auto constant_op = arith::ConstantIndexOp::create(
-          builder, ts_info.reserve_size_op.getLoc(), *chosen_tile_size);
+          builder, ts_info.reserve_size_op.getLoc(), chosen_tile_size);
       ts_info.reserve_size_op.getResult().replaceAllUsesWith(
           constant_op.getResult());
       ts_info.reserve_size_op.erase();
     }
-
-    // TODO: Replace this placeholder heuristic with a real cost model that
-    // accounts for L1 memory usage and performance. In particular, a future
-    // liveness analysis should determine which L1 buffers are live at each
-    // point so we can compute peak live scratchpad usage and choose tile sizes
-    // that fully utilize L1 capacity without exceeding the hardware limit.
-    (void)unresolved_ops;
   }
 };
 
 }  // namespace
 
-auto mlir::ktdf::createTileSizeSelectionPass() -> std::unique_ptr<Pass> {
-  return std::make_unique<TileSizeSelectionPass>();
+auto mlir::ktdf::createTileSizeSelectionPass(
+    const scheduler::SchedulerExtContext& scheduler_ctx) -> std::unique_ptr<Pass> {
+  auto pass = std::make_unique<TileSizeSelectionPass>();
+  pass->scheduler_ctx = &scheduler_ctx;
+  return pass;
 }

@@ -20,6 +20,16 @@ if(PROJECT_IS_TOP_LEVEL)
   message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
   message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
+  # Find external dependencies for agent integration
+  find_package(CURL REQUIRED)
+
+  # Fetch nlohmann_json
+  include(FetchContent)
+  FetchContent_Declare(json
+    URL https://github.com/nlohmann/json/releases/download/v3.11.2/json.tar.xz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(json)
+
   # Load LLVM and MLIR CMake modules.
   list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
   list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")

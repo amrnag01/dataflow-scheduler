@@ -23,6 +23,7 @@
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
+#include "dataflow-scheduler/Utils/AnthropicAgentClient.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "mlir/IR/Builders.h"
 
@@ -36,4 +37,15 @@ const SchedulerExtContext& SchedulerExtContext::dummyContext() {
   // The dummy context is initialized thread-safe and never written to.
   static const DummySchedulerExtContext dummy_ctx;
   return dummy_ctx;
+}
+
+AgentDrivenSchedulerContext::AgentDrivenSchedulerContext(
+    const std::string& api_key)
+    : agent_client(std::make_unique<AnthropicAgentClient>(api_key)) {}
+
+AgentDrivenSchedulerContext::~AgentDrivenSchedulerContext() = default;
+
+int64_t AgentDrivenSchedulerContext::selectTileSize(
+    mlir::ModuleOp module, TileSizeInfo& tile_size_info) {
+  return agent_client->selectTileSize(module, tile_size_info);
 }
