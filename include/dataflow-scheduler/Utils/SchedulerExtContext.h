@@ -22,7 +22,19 @@
 #include <mlir/IR/Attributes.h>
 #include <mlir/IR/BuiltinOps.h>
 
+#include <cstdint>
+#include <memory>
+#include <set>
+#include <string>
+
+#include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
+#include "dataflow-scheduler/Dialect/KTDF/TileSizeInfo.h"
+#include "llvm/Support/Error.h"
+
 namespace scheduler {
+
+// Forward declarations
+class AnthropicAgentClient;
 
 // Type alias for resource representation
 using ResourceType = mlir::Attribute;
@@ -37,6 +49,13 @@ struct SchedulerExtContext {
   static const SchedulerExtContext& dummyContext();
 
   virtual bool isDummy() const { return false; }
+
+  /// @brief Select a tile size for the given tile size problem.
+  /// Must be overridden by contexts that support agent-driven optimization.
+  virtual int64_t selectTileSize(mlir::ModuleOp module,
+                                 TileSizeInfo& tile_size_info) {
+    llvm::report_fatal_error("selectTileSize not implemented for this context");
+  }
 };
 
 /// @brief Construct a DummySchedulerExtContext. In general prefer
@@ -44,6 +63,17 @@ struct SchedulerExtContext {
 struct DummySchedulerExtContext : SchedulerExtContext {
   DummySchedulerExtContext() : SchedulerExtContext() {}
   bool isDummy() const override { return true; }
+};
+
+/// @brief Context with agent-driven tile size optimization.
+struct AgentDrivenSchedulerContext : SchedulerExtContext {
+  std::unique_ptr<AnthropicAgentClient> agent_client;
+
+  AgentDrivenSchedulerContext(const std::string& api_key);
+  ~AgentDrivenSchedulerContext();
+
+  virtual int64_t selectTileSize(mlir::ModuleOp module,
+                                 TileSizeInfo& tile_size_info) override;
 };
 
 }  // namespace scheduler

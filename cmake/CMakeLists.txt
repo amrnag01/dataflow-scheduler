@@ -34,12 +34,13 @@ install(DIRECTORY
     REGEX "CMakeFiles" EXCLUDE
 )
 
-install(EXPORT ${PROJECT_NAME}
-  FILE "${PROJECT_NAME}Targets.cmake"
-  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}"
-  NAMESPACE ${PROJECT_NAME}::
-  COMPONENT dataflow-scheduler-cmake
-)
+# TODO: Fix export to handle nlohmann_json dependency
+# install(EXPORT ${PROJECT_NAME}
+#   FILE "${PROJECT_NAME}Targets.cmake"
+#   DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}"
+#   NAMESPACE ${PROJECT_NAME}::
+#   COMPONENT dataflow-scheduler-cmake
+# )
 
 install(FILES
     "${PROJECT_CMAKE_DIR}/${PROJECT_NAME}Config.cmake"
@@ -51,10 +52,11 @@ install(FILES
 # Build tree
 #
 
-export(EXPORT ${PROJECT_NAME}
-  NAMESPACE ${PROJECT_NAME}::
-  FILE "${PROJECT_CMAKE_DIR}/${PROJECT_NAME}Targets.cmake"
-)
+# TODO: Fix export to handle nlohmann_json dependency
+# export(EXPORT ${PROJECT_NAME}
+#   NAMESPACE ${PROJECT_NAME}::
+#   FILE "${PROJECT_CMAKE_DIR}/${PROJECT_NAME}Targets.cmake"
+# )
 
 #
 # Build & install tree
