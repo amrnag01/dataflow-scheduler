@@ -35,6 +35,7 @@ namespace scheduler {
 
 // Forward declarations
 class AnthropicAgentClient;
+class AgenticTileSizeSelector;
 
 // Type alias for resource representation
 using ResourceType = mlir::Attribute;
@@ -55,26 +56,49 @@ struct SchedulerExtContext {
   virtual int64_t selectTileSize(mlir::ModuleOp module,
                                  TileSizeInfo& tile_size_info) {
     llvm::report_fatal_error("selectTileSize not implemented for this context");
-  }
-};
 
-/// @brief Construct a DummySchedulerExtContext. In general prefer
-/// SchedulerExtContext::dummyContext.
-struct DummySchedulerExtContext : SchedulerExtContext {
-  DummySchedulerExtContext() : SchedulerExtContext() {}
-  bool isDummy() const override { return true; }
-};
+    /// @brief Select all tile sizes for a module at once using agentic loop.
+    /// Must be overridden by contexts that support agent-driven optimization.
+    virtual std::vector<int64_t> selectAllTileSizes(
+        mlir::ModuleOp module, llvm::ArrayRef<TileSizeInfo> analyses) {
+      llvm::report_fatal_error(
+          "selectAllTileSizes not implemented for this context");
+    }
 
-/// @brief Context with agent-driven tile size optimization.
-struct AgentDrivenSchedulerContext : SchedulerExtContext {
-  std::unique_ptr<AnthropicAgentClient> agent_client;
+    /// @brief Select all tile sizes for a module at once using agentic loop.
+    /// Must be overridden by contexts that support agent-driven optimization.
+    virtual std::vector<int64_t> selectAllTileSizes(
+        mlir::ModuleOp module, llvm::ArrayRef<TileSizeInfo> analyses) {
+      llvm::report_fatal_error(
+          "selectAllTileSizes not implemented for this context");
+    }
+  };
 
-  AgentDrivenSchedulerContext(const std::string& api_key);
-  ~AgentDrivenSchedulerContext();
+  /// @brief Construct a DummySchedulerExtContext. In general prefer
+  /// SchedulerExtContext::dummyContext.
+  struct DummySchedulerExtContext : SchedulerExtContext {
+    DummySchedulerExtContext() : SchedulerExtContext() {}
+    bool isDummy() const override { return true; }
+  };
 
-  virtual int64_t selectTileSize(mlir::ModuleOp module,
-                                 TileSizeInfo& tile_size_info) override;
-};
+  /// @brief Context with agent-driven tile size optimization.
+  struct AgentDrivenSchedulerContext : SchedulerExtContext {
+    std::unique_ptr<AnthropicAgentClient> agent_client;
+    std::string ktdf_bindings_dir;
+    std::string cost_model_path;
+    std::string api_key;
+
+    AgentDrivenSchedulerContext(const std::string& api_key,
+                                const std::string& ktdf_bindings_dir,
+                                const std::string& cost_model_path);
+    ~AgentDrivenSchedulerContext();
+
+    virtual int64_t selectTileSize(mlir::ModuleOp module,
+                                   TileSizeInfo& tile_size_info) override;
+
+    virtual std::vector<int64_t> selectAllTileSizes(
+        mlir::ModuleOp module, llvm::ArrayRef<TileSizeInfo> analyses) override;
+  };
 
 }  // namespace scheduler
 

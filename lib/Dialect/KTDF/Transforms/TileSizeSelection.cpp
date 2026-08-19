@@ -26,6 +26,7 @@
 #include <optional>
 
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
+#include "dataflow-scheduler/Dialect/KTDF/TileSizeApply.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDF/TileSizeInfo.h"
 #include "dataflow-scheduler/Transforms/Utils/Utils.h"
@@ -107,29 +108,6 @@ void collectAssociatedLoops(
   }
 }
 
-
-int64_t chooseTileSizeViaAgent(
-    mlir::ModuleOp module,
-    TileSizeInfo& ts_info,
-    SchedulerExtContext& scheduler_ctx) {
-  int64_t min_value =
-      ts_info.reserve_size_op.getMinValue().getSExtValue();
-  int64_t divisibility =
-      ts_info.reserve_size_op.getDivisibility().getSExtValue();
-
-  int64_t selected_tile_size =
-      scheduler_ctx.selectTileSize(module, ts_info);
-
-  if (!validateTileSizeResult(selected_tile_size, ts_info, min_value,
-                              divisibility)) {
-    llvm::report_fatal_error(
-        llvm::Twine("Agent produced invalid tile size: ") +
-        llvm::Twine(selected_tile_size));
-  }
-
-  return selected_tile_size;
-}
-
 struct TileSizeSelectionPass
     : public ktdf::impl::TileSizeSelectionPassBase<TileSizeSelectionPass> {
   const SchedulerExtContext* scheduler_ctx = nullptr;
@@ -161,17 +139,35 @@ struct TileSizeSelectionPass
       analyses.push_back(std::move(ts_info));
     }
 
-    OpBuilder builder(module.getContext());
-    for (TileSizeInfo& ts_info : analyses) {
-      int64_t chosen_tile_size =
-          chooseTileSizeViaAgent(module, ts_info, const_cast<SchedulerExtContext&>(*scheduler_ctx));
+    // Use agentic loop to select all tile sizes at once
+    std::vector<int64_t> chosen_tile_sizes =
+        const_cast<SchedulerExtContext*>(scheduler_ctx)->selectAllTileSizes(module, analyses);
 
-      builder.setInsertionPoint(ts_info.reserve_size_op);
-      auto constant_op = arith::ConstantIndexOp::create(
-          builder, ts_info.reserve_size_op.getLoc(), chosen_tile_size);
-      ts_info.reserve_size_op.getResult().replaceAllUsesWith(
-          constant_op.getResult());
-      ts_info.reserve_size_op.erase();
+    if (chosen_tile_sizes.size() != analyses.size()) {
+      llvm::report_fatal_error(
+          "Agentic selector returned wrong number of tile sizes");
+    }
+
+    // Validate each tile size
+    for (size_t i = 0; i < analyses.size(); ++i) {
+      TileSizeInfo& ts_info = analyses[i];
+      int64_t tile_size = chosen_tile_sizes[i];
+
+      int64_t min_value = ts_info.reserve_size_op.getMinValue().getSExtValue();
+      int64_t divisibility =
+          ts_info.reserve_size_op.getDivisibility().getSExtValue();
+
+      if (!validateTileSizeResult(tile_size, ts_info, min_value, divisibility)) {
+        llvm::report_fatal_error(
+            llvm::Twine("Agent produced invalid tile size: ") +
+            llvm::Twine(tile_size));
+      }
+    }
+
+    // Apply tile sizes
+    OpBuilder builder(module.getContext());
+    for (size_t i = 0; i < analyses.size(); ++i) {
+      applyTileSize(builder, analyses[i], chosen_tile_sizes[i]);
     }
   }
 };

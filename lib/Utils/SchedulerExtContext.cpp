@@ -23,6 +23,7 @@
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
+#include "dataflow-scheduler/Utils/AgenticTileSizeSelector.h"
 #include "dataflow-scheduler/Utils/AnthropicAgentClient.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "mlir/IR/Builders.h"
@@ -40,12 +41,24 @@ const SchedulerExtContext& SchedulerExtContext::dummyContext() {
 }
 
 AgentDrivenSchedulerContext::AgentDrivenSchedulerContext(
-    const std::string& api_key)
-    : agent_client(std::make_unique<AnthropicAgentClient>(api_key)) {}
+    const std::string& api_key,
+    const std::string& ktdf_bindings_dir,
+    const std::string& cost_model_path)
+    : agent_client(std::make_unique<AnthropicAgentClient>(api_key)),
+      ktdf_bindings_dir(ktdf_bindings_dir),
+      cost_model_path(cost_model_path),
+      api_key(api_key) {}
 
 AgentDrivenSchedulerContext::~AgentDrivenSchedulerContext() = default;
 
 int64_t AgentDrivenSchedulerContext::selectTileSize(
     mlir::ModuleOp module, TileSizeInfo& tile_size_info) {
   return agent_client->selectTileSize(module, tile_size_info);
+}
+
+std::vector<int64_t> AgentDrivenSchedulerContext::selectAllTileSizes(
+    mlir::ModuleOp module,
+    llvm::ArrayRef<TileSizeInfo> analyses) {
+  AgenticTileSizeSelector selector(api_key, ktdf_bindings_dir, cost_model_path);
+  return selector.run(module, analyses);
 }

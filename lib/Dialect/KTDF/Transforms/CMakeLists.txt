@@ -9,6 +9,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFTransforms
     SubsumeLinearizeIndex.cpp
     TileNormalized.cpp
     TileSizeSelection.cpp
+    TileSizeApply.cpp
 
   ADDITIONAL_HEADER_DIRS
     ${DataflowScheduler_SOURCE_DIR}/include/dataflow-scheduler/Dialect/KTDF/Transforms
