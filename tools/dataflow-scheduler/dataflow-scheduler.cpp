@@ -49,6 +49,16 @@ void registerPassPipelinesForScheduler() {
       llvm::cl::desc("Anthropic API key for agent-driven tile size selection"),
       llvm::cl::init(""));
 
+  static llvm::cl::opt<std::string> ktdfBindingsDir(
+      "ktdf_bindings_dir",
+      llvm::cl::desc("Path to MLIR Python bindings directory for cost model"),
+      llvm::cl::init(""));
+
+  static llvm::cl::opt<std::string> costModelPath(
+      "cost_model_path",
+      llvm::cl::desc("Path to samm-ktdf cost model directory"),
+      llvm::cl::init(""));
+
   mlir::PassPipelineRegistration<>(
       "kEmitDFIR", "Emit DataflowIR", [&](mlir::OpPassManager& pm) {
         // Try to get API key from environment or CLI flag
@@ -61,8 +71,15 @@ void registerPassPipelinesForScheduler() {
         }
 
         if (!api_key.empty()) {
+          // API key provided — require cost model paths
+          if (ktdfBindingsDir.empty() || costModelPath.empty()) {
+            llvm::report_fatal_error(
+                "When using agent-driven tile size selection, both "
+                "-ktdf_bindings_dir and -cost_model_path must be provided");
+          }
           g_scheduler_context =
-              std::make_unique<scheduler::AgentDrivenSchedulerContext>(api_key);
+              std::make_unique<scheduler::AgentDrivenSchedulerContext>(
+                  api_key, ktdfBindingsDir, costModelPath);
         } else {
           g_scheduler_context =
               std::make_unique<scheduler::DummySchedulerExtContext>();
