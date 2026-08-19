@@ -27,6 +27,7 @@
 #pragma clang diagnostic pop
 
 #include <fstream>
+#include <iomanip>
 #include <map>
 #include <regex>
 #include <sstream>
@@ -50,10 +51,12 @@ static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::stri
 AgenticTileSizeSelector::AgenticTileSizeSelector(
     const std::string& api_key,
     const std::string& ktdf_bindings_dir,
-    const std::string& cost_model_path)
+    const std::string& cost_model_path,
+    bool debug)
     : api_key_(api_key),
       ktdf_bindings_dir_(ktdf_bindings_dir),
-      cost_model_path_(cost_model_path) {}
+      cost_model_path_(cost_model_path),
+      debug_(debug) {}
 
 AgenticTileSizeSelector::~AgenticTileSizeSelector() = default;
 
@@ -93,11 +96,6 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
     json response_json;
     response_json = json::parse(response);
 
-    llvm::errs() << "[Agent] Response received. Keys: ";
-    for (auto& [key, val] : response_json.items()) {
-      llvm::errs() << key << " ";
-    }
-    llvm::errs() << "\n";
 
     if (response_json.contains("error")) {
       llvm::errs() << "[Agent] Error in response: " << response_json["error"].dump() << "\n";
@@ -110,7 +108,6 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
       }
 
       bool found_tool_use = false;
-      llvm::errs() << "[Agent] Content blocks: " << content.size() << "\n";
 
       for (const auto& block : content) {
         if (block.contains("type") && block["type"] == "tool_use") {
@@ -185,8 +182,10 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
 
             llvm::errs() << "[Agent Iteration " << (iteration + 1) << "] Reasoning: " << reasoning << "\n";
             if (result.success) {
+              std::ostringstream latency_str;
+              latency_str << std::setprecision(15) << result.latency;
               llvm::errs() << "[Agent Iteration " << (iteration + 1) << "] Latency: "
-                           << result.latency << " sec\n";
+                           << latency_str.str() << " sec\n";
             } else {
               llvm::errs() << "[Agent Iteration " << (iteration + 1) << "] Error: "
                            << result.error_message << "\n";
@@ -209,7 +208,10 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
             tool_result["type"] = "tool_result";
             tool_result["tool_use_id"] = block["id"];
             if (result.success) {
-              tool_result["content"] = "Latency: " + std::to_string(result.latency) + " sec";
+              // Format with full precision
+              std::ostringstream oss;
+              oss << std::setprecision(15) << result.latency;
+              tool_result["content"] = "Latency: " + oss.str() + " sec";
             } else {
               tool_result["content"] = "Error: " + result.error_message;
               tool_result["is_error"] = true;
@@ -235,11 +237,28 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(llvm::ArrayRef<TileSizeIn
   std::stringstream ss;
   ss << "You are a compiler optimization expert tasked with selecting optimal tile sizes for loop tiling.\n\n";
 
+  ss << "=== COST MODEL UNDERSTANDING ===\n";
+  ss << "The SAMM cost model computes latency via:\n";
+  ss << "1. Tile sizes control loop iteration counts: larger tiles = fewer iterations\n";
+  ss << "2. Data transfers: latency = total_bytes / bandwidth_GBps\n";
+  ss << "   - HBM bandwidth: 153 GBps\n";
+  ss << "   - LX-to-compute bandwidth: 282.4 GBps (2 * 128 * 1.1 GHz)\n";
+  ss << "3. Compute operations: latency = total_ops / (parallelism * frequency * utilization)\n";
+  ss << "   - Frequency: 1.1 GHz\n";
+  ss << "   - Add/sub/mul: 2 instructions, 256 parallel engines\n";
+  ss << "   - Division: 10 instructions, 256 parallel engines\n";
+  ss << "4. Schedule tree dependency: operations with more iterations have more quanta\n";
+  ss << "   - Larger tile sizes reduce iterations → fewer quanta → lower total latency\n";
+  ss << "5. Bottleneck analysis: identify which operations dominate latency\n\n";
+
   ss << "You have access to a tool called transform_and_evaluate_cost that:\n";
   ss << "1. Takes an array of tile-size assignments (id -> tile_size)\n";
-  ss << "2. Clones the current IR and substitutes each reserve_size placeholder with an arith.constant\n";
-  ss << "3. Passes the transformed IR to the SAMM cost model\n";
-  ss << "4. Returns the measured latency in seconds, or an error\n\n";
+  ss << "2. Applies tiling to the IR (replaces reserve_size placeholders with constants)\n";
+  ss << "3. Passes to SAMM cost model which:\n";
+  ss << "   - Parses the IR to extract operations and memory access patterns\n";
+  ss << "   - Builds a schedule tree with pipelined stages and dependencies\n";
+  ss << "   - Computes total bytes and ops for each tile size configuration\n";
+  ss << "4. Returns the measured latency in seconds\n\n";
 
   ss << "Tiling Decision Points:\n";
   for (size_t i = 0; i < analyses.size(); ++i) {
@@ -257,11 +276,22 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(llvm::ArrayRef<TileSizeIn
     ss << "\n";
   }
 
-  ss << "\nConstraints:\n";
+  ss << "\nYour Task:\n";
+  ss << "- Explore tile size space systematically to find the configuration with minimum latency\n";
+  ss << "- Use the cost model formulas to reason about latency relationships\n";
+  ss << "- Verify your reasoning by calling the tool with different tile size candidates\n";
+  ss << "- Consider how tile sizes affect:\n";
+  ss << "  * Total iteration count (product of all loop trip counts / tile_size)\n";
+  ss << "  * Total data transferred (sum of all quanta bytes across iterations)\n";
+  ss << "  * Total compute operations (sum of all quanta ops across iterations)\n";
+  ss << "  * Critical path dependencies in the schedule tree\n";
+  ss << "- Different workloads have different optimal tile sizes - data-bound vs compute-bound\n";
+  ss << "- No assumption about which end of the range is better - verify empirically\n\n";
+
+  ss << "Constraints:\n";
   ss << "- Each tile size must be >= min_value\n";
   ss << "- Each tile size must be divisible by its divisibility requirement\n";
-  ss << "- Explore systematically: try different combinations and learn from latencies\n";
-  ss << "- When satisfied with your exploration, call submit_final_answer with the best assignment and explain why.\n";
+  ss << "- When satisfied with your exploration, call submit_final_answer with the best assignment and your reasoning.\n";
 
   return ss.str();
 }
@@ -371,13 +401,50 @@ AgenticTileSizeSelector::TransformResult AgenticTileSizeSelector::handleTransfor
   f << module_str;
   f.close();
 
-  // Run cost model subprocess
+  // Run cost model subprocess (will return success_status before dumping)
+  // We need to check if result succeeded to pass that info to the dumping function
   auto result = runCostModelSubprocess(std::string(temp_file.c_str()), module_str, tile_size_assignments);
+
+  // Optionally dump IR for debugging
+  if (debug_) {
+    dumpDebugIR(module_str, tile_size_assignments, result.success);
+  }
 
   // Clean up temp file
   llvm::sys::fs::remove(temp_file);
 
   return result;
+}
+
+void AgenticTileSizeSelector::dumpDebugIR(
+    const std::string& ir_str,
+    const std::vector<std::pair<int64_t, int64_t>>& tile_size_assignments,
+    bool success) {
+  // Create debug directory structure
+  llvm::sys::fs::create_directories("debug/success");
+  llvm::sys::fs::create_directories("debug/fail");
+
+  // Build filename from tile sizes: ktdf_1_64.mlir
+  std::stringstream filename_ss;
+  filename_ss << "ktdf";
+  for (const auto& [id, tile_size] : tile_size_assignments) {
+    filename_ss << "_" << tile_size;
+  }
+  filename_ss << ".mlir";
+  std::string filename = filename_ss.str();
+
+  // Choose directory based on success
+  std::string filepath = success ? "debug/success/" : "debug/fail/";
+  filepath += filename;
+
+  // Write IR to file
+  std::ofstream debug_file(filepath);
+  debug_file << ir_str;
+  debug_file.close();
+
+  if (debug_) {
+    llvm::errs() << "[Debug] Dumped IR to " << filepath << "\n";
+  }
 }
 
 AgenticTileSizeSelector::TransformResult AgenticTileSizeSelector::runCostModelSubprocess(

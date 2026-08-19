@@ -87,10 +87,12 @@ struct SchedulerExtContext {
     std::string ktdf_bindings_dir;
     std::string cost_model_path;
     std::string api_key;
+    bool debug;
 
     AgentDrivenSchedulerContext(const std::string& api_key,
                                 const std::string& ktdf_bindings_dir,
-                                const std::string& cost_model_path);
+                                const std::string& cost_model_path,
+                                bool debug = false);
     ~AgentDrivenSchedulerContext();
 
     virtual int64_t selectTileSize(mlir::ModuleOp module,
