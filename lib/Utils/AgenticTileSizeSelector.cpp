@@ -67,6 +67,13 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
     return {};
   }
 
+  // Clean up debug folder if it exists and recreate it
+  if (debug_) {
+    llvm::sys::fs::remove_directories("debug");
+    llvm::sys::fs::create_directories("debug/success");
+    llvm::sys::fs::create_directories("debug/fail");
+  }
+
   std::string system_prompt = buildSystemPrompt(analyses);
   std::string tool_schemas = buildToolSchemas();
 
@@ -82,8 +89,6 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
   // Tool-use loop
   int max_iterations = 20;
   for (int iteration = 0; iteration < max_iterations; ++iteration) {
-    llvm::errs() << "[Agent] Iteration " << (iteration + 1) << " starting...\n";
-
     // Build messages JSON array
     json messages_array = json::array();
     for (const auto& msg : messages) {
@@ -178,17 +183,22 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
 
             std::string reasoning = input["reasoning"].get<std::string>();
 
+            // Print what we're trying before executing
+            llvm::errs() << "[Agent] Trying: ";
+            for (size_t i = 0; i < tile_size_assignments.size(); ++i) {
+              llvm::errs() << (i > 0 ? ", " : "") << tile_size_assignments[i].second;
+            }
+            llvm::errs() << "\n";
+
             auto result = handleTransformAndEvaluateCost(module, analyses, tile_size_assignments);
 
-            llvm::errs() << "[Agent Iteration " << (iteration + 1) << "] Reasoning: " << reasoning << "\n";
+            llvm::errs() << "Reasoning: " << reasoning << "\n";
             if (result.success) {
               std::ostringstream latency_str;
               latency_str << std::setprecision(15) << result.latency;
-              llvm::errs() << "[Agent Iteration " << (iteration + 1) << "] Latency: "
-                           << latency_str.str() << " sec\n";
+              llvm::errs() << "Latency: " << latency_str.str() << " sec\n";
             } else {
-              llvm::errs() << "[Agent Iteration " << (iteration + 1) << "] Error: "
-                           << result.error_message << "\n";
+              llvm::errs() << "Error: " << result.error_message << "\n";
             }
 
             // Add assistant message with tool_use
@@ -441,10 +451,6 @@ void AgenticTileSizeSelector::dumpDebugIR(
   std::ofstream debug_file(filepath);
   debug_file << ir_str;
   debug_file.close();
-
-  if (debug_) {
-    llvm::errs() << "[Debug] Dumped IR to " << filepath << "\n";
-  }
 }
 
 AgenticTileSizeSelector::TransformResult AgenticTileSizeSelector::runCostModelSubprocess(
