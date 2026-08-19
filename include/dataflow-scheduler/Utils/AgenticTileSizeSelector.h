@@ -41,7 +41,8 @@ class AgenticTileSizeSelector {
   explicit AgenticTileSizeSelector(
       const std::string& api_key,
       const std::string& ktdf_bindings_dir,
-      const std::string& cost_model_path);
+      const std::string& cost_model_path,
+      bool debug = false);
   ~AgenticTileSizeSelector();
 
   // Run the tool-use loop to select tile sizes for all reserve_size ops
@@ -54,6 +55,7 @@ class AgenticTileSizeSelector {
   std::string api_key_;
   std::string ktdf_bindings_dir_;
   std::string cost_model_path_;
+  bool debug_;
 
   // Prompt building
   std::string buildSystemPrompt(llvm::ArrayRef<TileSizeInfo> analyses);
@@ -76,6 +78,12 @@ class AgenticTileSizeSelector {
       const std::string& ir_file,
       const std::string& ir_str,
       const std::vector<std::pair<int64_t, int64_t>>& tile_size_assignments);
+
+  // Debug IR dumping
+  void dumpDebugIR(
+      const std::string& ir_str,
+      const std::vector<std::pair<int64_t, int64_t>>& tile_size_assignments,
+      bool success);
 
   // HTTP communication with Claude
   std::string makeHttpRequestWithTools(
