@@ -415,9 +415,22 @@ AgenticTileSizeSelector::TransformResult AgenticTileSizeSelector::handleTransfor
   // We need to check if result succeeded to pass that info to the dumping function
   auto result = runCostModelSubprocess(std::string(temp_file.c_str()), module_str, tile_size_assignments);
 
-  // Optionally dump IR for debugging
+  // If cost model failed, dump IR and terminate immediately
+  if (!result.success) {
+    dumpDebugIR(module_str, tile_size_assignments, false);
+    llvm::errs() << "\n=== COST MODEL FAILED ===\n";
+    llvm::errs() << "Tile size assignments:\n";
+    for (const auto& [id, tile_size] : tile_size_assignments) {
+      llvm::errs() << "  ID " << id << " -> " << tile_size << "\n";
+    }
+    llvm::errs() << "\nError:\n" << result.error_message << "\n";
+    llvm::sys::fs::remove(temp_file);
+    llvm::report_fatal_error("Cost model execution failed");
+  }
+
+  // Dump successful IR if debug flag is enabled
   if (debug_) {
-    dumpDebugIR(module_str, tile_size_assignments, result.success);
+    dumpDebugIR(module_str, tile_size_assignments, true);
   }
 
   // Clean up temp file
@@ -488,25 +501,9 @@ AgenticTileSizeSelector::TransformResult AgenticTileSizeSelector::runCostModelSu
   llvm::sys::fs::remove(output_file);
 
   if (ret_code != 0) {
-    // Parser error - dump IR and die immediately
-    llvm::errs() << "\n=== COST MODEL PARSER FAILED ===\n";
-    llvm::errs() << "Tile size assignments:\n";
-    for (const auto& [id, tile_size] : tile_size_assignments) {
-      llvm::errs() << "  ID " << id << " -> " << tile_size << "\n";
-    }
-    llvm::errs() << "\nError output:\n" << output_content << "\n";
-
-    // Create debug directory if it doesn't exist
-    llvm::sys::fs::create_directories("debug");
-
-    // Write IR to debug file
-    std::ofstream debug_file("debug/failed_tilesize_ir.mlir");
-    debug_file << ir_str;
-    debug_file.close();
-
-    llvm::report_fatal_error(
-        llvm::Twine("Cost model parser failed. IR dumped to debug/failed_tilesize_ir.mlir. Error:\n") +
-        output_content);
+    // Cost model subprocess failed - return error result (don't crash)
+    return {false, 0.0, "Cost model subprocess exited with code " + std::to_string(ret_code) +
+                       "\n" + output_content};
   }
 
   // Parse latency from output - look for last occurrence of "Latency: X sec"
@@ -527,17 +524,8 @@ AgenticTileSizeSelector::TransformResult AgenticTileSizeSelector::runCostModelSu
     return {true, last_latency, ""};
   }
 
-  // If not found at all, die with full output
-  llvm::errs() << "\n=== COST MODEL LATENCY PARSE FAILED ===\n";
-  llvm::errs() << "Full output:\n" << output_content << "\n";
-
-  llvm::sys::fs::create_directories("debug");
-  std::ofstream debug_file("debug/failed_tilesize_ir.mlir");
-  debug_file << ir_str;
-  debug_file.close();
-
-  llvm::report_fatal_error(
-      llvm::Twine("Could not parse latency from cost model output. IR dumped to debug/failed_tilesize_ir.mlir."));
+  // Could not parse latency - return error result
+  return {false, 0.0, "Could not parse latency from cost model output:\n" + output_content};
 }
 
 std::string AgenticTileSizeSelector::makeHttpRequestWithTools(
