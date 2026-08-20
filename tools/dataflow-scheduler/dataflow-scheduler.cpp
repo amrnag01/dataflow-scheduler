@@ -95,8 +95,7 @@ void registerPassPipelinesForScheduler() {
                           "--anthropic-api-key flag.\n";
         }
 
-        scheduler::buildKTDPToDFIRPipeline(
-            pm, scheduler::SchedulerExtContext::dummyContext());
+        scheduler::buildKTDPToDFIRPipeline(pm, *g_scheduler_context);
         pm.addPass(scheduler::createSplitDFIROutputPass(splitDFIROutputDir));
       });
 }
