@@ -27,9 +27,9 @@
 #include <set>
 #include <string>
 
+#include "llvm/Support/Error.h"
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
 #include "dataflow-scheduler/Dialect/KTDF/TileSizeInfo.h"
-#include "llvm/Support/Error.h"
 
 namespace scheduler {
 
@@ -53,54 +53,53 @@ struct SchedulerExtContext {
 
   /// @brief Select a tile size for the given tile size problem.
   /// Must be overridden by contexts that support agent-driven optimization.
-  virtual int64_t selectTileSize(mlir::ModuleOp module,
-                                 TileSizeInfo& tile_size_info) {
-    llvm::report_fatal_error("selectTileSize not implemented for this context");
+  virtual int64_t selectTileSize(
+      mlir::ModuleOp module,
+      TileSizeInfo& tile_size_info) {
+    llvm::report_fatal_error(
+        "selectTileSize not implemented for this context");
+  }
 
-    /// @brief Select all tile sizes for a module at once using agentic loop.
-    /// Must be overridden by contexts that support agent-driven optimization.
-    virtual std::vector<int64_t> selectAllTileSizes(
-        mlir::ModuleOp module, llvm::ArrayRef<TileSizeInfo> analyses) {
-      llvm::report_fatal_error(
-          "selectAllTileSizes not implemented for this context");
-    }
+  /// @brief Select all tile sizes for a module at once using agentic loop.
+  /// Must be overridden by contexts that support agent-driven optimization.
+  virtual std::vector<int64_t> selectAllTileSizes(
+      mlir::ModuleOp module,
+      llvm::ArrayRef<TileSizeInfo> analyses) {
+    llvm::report_fatal_error(
+        "selectAllTileSizes not implemented for this context");
+  }
+};
 
-    /// @brief Select all tile sizes for a module at once using agentic loop.
-    /// Must be overridden by contexts that support agent-driven optimization.
-    virtual std::vector<int64_t> selectAllTileSizes(
-        mlir::ModuleOp module, llvm::ArrayRef<TileSizeInfo> analyses) {
-      llvm::report_fatal_error(
-          "selectAllTileSizes not implemented for this context");
-    }
-  };
+/// @brief Construct a DummySchedulerExtContext. In general prefer
+/// SchedulerExtContext::dummyContext.
+struct DummySchedulerExtContext : SchedulerExtContext {
+  DummySchedulerExtContext() : SchedulerExtContext() {}
+  bool isDummy() const override { return true; }
+};
 
-  /// @brief Construct a DummySchedulerExtContext. In general prefer
-  /// SchedulerExtContext::dummyContext.
-  struct DummySchedulerExtContext : SchedulerExtContext {
-    DummySchedulerExtContext() : SchedulerExtContext() {}
-    bool isDummy() const override { return true; }
-  };
+/// @brief Context with agent-driven tile size optimization.
+struct AgentDrivenSchedulerContext : SchedulerExtContext {
+  std::unique_ptr<AnthropicAgentClient> agent_client;
+  std::string ktdf_bindings_dir;
+  std::string cost_model_path;
+  std::string api_key;
+  bool debug;
 
-  /// @brief Context with agent-driven tile size optimization.
-  struct AgentDrivenSchedulerContext : SchedulerExtContext {
-    std::unique_ptr<AnthropicAgentClient> agent_client;
-    std::string ktdf_bindings_dir;
-    std::string cost_model_path;
-    std::string api_key;
-    bool debug;
+  AgentDrivenSchedulerContext(
+      const std::string& api_key,
+      const std::string& ktdf_bindings_dir,
+      const std::string& cost_model_path,
+      bool debug = false);
+  ~AgentDrivenSchedulerContext();
 
-    AgentDrivenSchedulerContext(const std::string& api_key,
-                                const std::string& ktdf_bindings_dir,
-                                const std::string& cost_model_path,
-                                bool debug = false);
-    ~AgentDrivenSchedulerContext();
+  virtual int64_t selectTileSize(
+      mlir::ModuleOp module,
+      TileSizeInfo& tile_size_info) override;
 
-    virtual int64_t selectTileSize(mlir::ModuleOp module,
-                                   TileSizeInfo& tile_size_info) override;
-
-    virtual std::vector<int64_t> selectAllTileSizes(
-        mlir::ModuleOp module, llvm::ArrayRef<TileSizeInfo> analyses) override;
-  };
+  virtual std::vector<int64_t> selectAllTileSizes(
+      mlir::ModuleOp module,
+      llvm::ArrayRef<TileSizeInfo> analyses) override;
+};
 
 }  // namespace scheduler
 
