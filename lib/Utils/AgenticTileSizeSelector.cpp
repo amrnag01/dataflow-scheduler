@@ -74,6 +74,9 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
     llvm::sys::fs::create_directories("debug/fail");
   }
 
+  // Compute loop granularities once
+  computeLoopGranularities(analyses);
+
   std::string system_prompt = buildSystemPrompt(analyses);
   std::string tool_schemas = buildToolSchemas();
 
@@ -286,21 +289,40 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(llvm::ArrayRef<TileSizeIn
     ss << "\n";
   }
 
-  ss << "\nYour Task:\n";
-  ss << "- Explore tile size space systematically to find the configuration with minimum latency\n";
-  ss << "- Use the cost model formulas to reason about latency relationships\n";
-  ss << "- Verify your reasoning by calling the tool with different tile size candidates\n";
-  ss << "- Consider how tile sizes affect:\n";
-  ss << "  * Total iteration count (product of all loop trip counts / tile_size)\n";
-  ss << "  * Total data transferred (sum of all quanta bytes across iterations)\n";
-  ss << "  * Total compute operations (sum of all quanta ops across iterations)\n";
+  ss << "\n=== INITIAL HEURISTIC ===\n";
+  ss << "A baseline greedy heuristic (used in prior work) selects tile sizes as follows:\n";
+  ss << "For each tiling decision point ID (independently):\n";
+  ss << "1. Start with candidate = max(2, min_value)\n";
+  ss << "2. Iterate candidate downward to min_value (stepping by 1)\n";
+  ss << "3. Skip any candidate where (candidate % divisibility != 0)\n";
+  ss << "4. For each candidate, check if it divides evenly into ALL associated loop total_sizes\n";
+  ss << "   (i.e., for each associated loop, verify: total_size % candidate == 0)\n";
+  ss << "5. Return the HIGHEST (first) valid candidate that satisfies all constraints\n";
+  ss << "This heuristic prioritizes larger tile sizes (fewer iterations) within constraints.\n";
+  ss << "YOUR FIRST CALL should evaluate the heuristic-selected tile sizes to establish baseline latency.\n\n";
+
+  ss << "Your Task:\n";
+  ss << "1. First, apply the heuristic algorithm to compute initial tile size for each decision point\n";
+  ss << "2. Call transform_and_evaluate_cost with these heuristic-selected tile sizes\n";
+  ss << "3. Then explore tile size space systematically to find configurations with better latency\n";
+  ss << "4. Use the cost model formulas to reason about latency relationships\n";
+  ss << "5. When satisfied with your exploration, submit your best found configuration\n";
+  ss << "Consider how tile sizes affect:\n";
+  ss << "  * Total iteration count (product of loop trip counts / tile_size)\n";
+  ss << "  * Total data transferred (sum of bytes across all iterations)\n";
+  ss << "  * Total compute operations (sum of ops across all iterations)\n";
   ss << "  * Critical path dependencies in the schedule tree\n";
-  ss << "- Different workloads have different optimal tile sizes - data-bound vs compute-bound\n";
-  ss << "- No assumption about which end of the range is better - verify empirically\n\n";
+  ss << "Remember: different workloads have different optimal tiles (data-bound vs compute-bound).\n\n";
 
   ss << "Constraints:\n";
   ss << "- Each tile size must be >= min_value\n";
   ss << "- Each tile size must be divisible by its divisibility requirement\n";
+  ss << "- CRITICAL: When tiling a loop that contains parallel regions in its body,\n";
+  ss << "  the tile size must be a multiple of LCM(num_instances of all those parallel regions).\n";
+  ss << "    * If a loop contains a parallel region with num_instances=2, tile_size must be even.\n";
+  ss << "    * If a loop contains parallel regions with num_instances=2 and num_instances=3,\n";
+  ss << "      then tile_size must be divisible by LCM(2,3)=6.\n";
+  ss << "    * If no parallel regions are in the loop body, any valid tile size is acceptable.\n";
   ss << "- When satisfied with your exploration, call submit_final_answer with the best assignment and your reasoning.\n";
 
   return ss.str();
@@ -364,6 +386,12 @@ AgenticTileSizeSelector::TransformResult AgenticTileSizeSelector::handleTransfor
     mlir::ModuleOp module,
     llvm::ArrayRef<TileSizeInfo> analyses,
     const std::vector<std::pair<int64_t, int64_t>>& tile_size_assignments) {
+
+  // Validate tile sizes against granularity constraints
+  std::string validation_error;
+  if (!validateTileSizeGranularities(analyses, tile_size_assignments, validation_error)) {
+    return {false, 0.0, "Granularity constraint violation: " + validation_error};
+  }
 
   // Clone module
   auto cloned_module = llvm::cast<mlir::ModuleOp>(module->clone());
@@ -578,6 +606,65 @@ std::string AgenticTileSizeSelector::makeHttpRequestWithTools(
   curl_easy_cleanup(curl);
 
   return response;
+}
+
+void AgenticTileSizeSelector::computeLoopGranularities(
+    llvm::ArrayRef<TileSizeInfo> analyses) {
+  // For each loop in the analyses, compute the LCM of num_instances
+  // of all parallel regions in its body
+  for (const auto& analysis : analyses) {
+    for (const auto& loop_info : analysis.associated_loops) {
+      auto loop = loop_info.loop;
+
+      // Find all parallel regions in this loop's body
+      int64_t granularity = 1;
+      loop.walk([&](mlir::ktdf::ParallelOp parallel_op) {
+        int64_t num_instances = parallel_op.getNumInstances();
+        // Compute LCM(granularity, num_instances)
+        granularity = (granularity / std::gcd(granularity, num_instances)) * num_instances;
+      });
+
+      loop_granularities_[loop] = granularity;
+    }
+  }
+}
+
+bool AgenticTileSizeSelector::validateTileSizeGranularities(
+    llvm::ArrayRef<TileSizeInfo> analyses,
+    const std::vector<std::pair<int64_t, int64_t>>& tile_size_assignments,
+    std::string& error_message) {
+
+  for (size_t i = 0; i < analyses.size(); ++i) {
+    auto& analysis = const_cast<TileSizeInfo&>(analyses[i]);
+
+    // Find the tile size for this analysis
+    int64_t tile_size = -1;
+    for (const auto& [id, ts] : tile_size_assignments) {
+      if (id == (int64_t)i) {
+        tile_size = ts;
+        break;
+      }
+    }
+
+    if (tile_size < 0) continue;  // Not assigned yet
+
+    // Check granularity constraint for each associated loop
+    for (const auto& loop_info : analysis.associated_loops) {
+      auto it = loop_granularities_.find(loop_info.loop);
+      if (it == loop_granularities_.end()) continue;
+
+      int64_t granularity = it->second;
+      if (granularity > 1 && tile_size % granularity != 0) {
+        error_message = "Tile size " + std::to_string(tile_size) +
+                        " for loop ID " + std::to_string(i) +
+                        " must be divisible by " + std::to_string(granularity) +
+                        " (LCM of parallel region num_instances)";
+        return false;
+      }
+    }
+  }
+
+  return true;
 }
 
 }  // namespace scheduler
