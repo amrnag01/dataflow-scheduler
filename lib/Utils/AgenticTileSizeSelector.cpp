@@ -280,7 +280,20 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(llvm::ArrayRef<TileSizeIn
     int64_t divisibility =
         analysis.reserve_size_op.getDivisibility().getSExtValue();
     ss << "ID " << i << ": min_value=" << min_value
-       << ", divisibility=" << divisibility << "\n";
+       << ", divisibility=" << divisibility;
+
+    // Add granularity information for this ID
+    int64_t granularity = 1;
+    for (const auto& loop_info : analysis.associated_loops) {
+      auto it = loop_granularities_.find(loop_info.loop);
+      if (it != loop_granularities_.end()) {
+        granularity = it->second;
+        break;  // Use the first loop's granularity (all should be same)
+      }
+    }
+    ss << ", granularity=" << granularity;
+
+    ss << "\n";
     ss << "  Associated loops (total_size): ";
     for (size_t j = 0; j < analysis.associated_loops.size(); ++j) {
       if (j > 0) ss << ", ";
@@ -317,12 +330,23 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(llvm::ArrayRef<TileSizeIn
   ss << "Constraints:\n";
   ss << "- Each tile size must be >= min_value\n";
   ss << "- Each tile size must be divisible by its divisibility requirement\n";
-  ss << "- CRITICAL: When tiling a loop that contains parallel regions in its body,\n";
-  ss << "  the tile size must be a multiple of LCM(num_instances of all those parallel regions).\n";
-  ss << "    * If a loop contains a parallel region with num_instances=2, tile_size must be even.\n";
-  ss << "    * If a loop contains parallel regions with num_instances=2 and num_instances=3,\n";
-  ss << "      then tile_size must be divisible by LCM(2,3)=6.\n";
-  ss << "    * If no parallel regions are in the loop body, any valid tile size is acceptable.\n";
+  ss << "- CRITICAL: Granularity constraints from parallel regions:\n";
+  for (size_t i = 0; i < analyses.size(); ++i) {
+    auto& analysis = const_cast<TileSizeInfo&>(analyses[i]);
+    int64_t granularity = 1;
+    for (const auto& loop_info : analysis.associated_loops) {
+      auto it = loop_granularities_.find(loop_info.loop);
+      if (it != loop_granularities_.end()) {
+        granularity = it->second;
+        break;
+      }
+    }
+    ss << "  * ID " << i << ": tile_size must be divisible by " << granularity;
+    if (granularity > 1) {
+      ss << " (LCM of num_instances from parallel regions in loops)";
+    }
+    ss << "\n";
+  }
   ss << "- When satisfied with your exploration, call submit_final_answer with the best assignment and your reasoning.\n";
 
   return ss.str();
