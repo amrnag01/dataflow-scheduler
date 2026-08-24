@@ -57,9 +57,21 @@ class AgenticTileSizeSelector {
   std::string cost_model_path_;
   bool debug_;
 
+  // Maps each loop to the LCM of num_instances of parallel regions in its body
+  std::map<mlir::scf::ForOp, int64_t> loop_granularities_;
+
   // Prompt building
   std::string buildSystemPrompt(llvm::ArrayRef<TileSizeInfo> analyses);
   std::string buildToolSchemas();
+
+  // Compute granularities for all loops once
+  void computeLoopGranularities(llvm::ArrayRef<TileSizeInfo> analyses);
+
+  // Validate tile sizes against granularity constraints
+  bool validateTileSizeGranularities(
+      llvm::ArrayRef<TileSizeInfo> analyses,
+      const std::vector<std::pair<int64_t, int64_t>>& tile_size_assignments,
+      std::string& error_message);
 
   // Tool execution
   struct TransformResult {
