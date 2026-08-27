@@ -285,17 +285,21 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
   json user_msg;
   user_msg["role"] = "user";
   user_msg["content"] =
-      "You are optimizing a symbolic cost function to find tile size values "
-      "that "
-      "minimize latency. Use the evaluate_cost tool to test different tile "
-      "size "
-      "assignments and understand how intermediate variables affect the "
-      "result. "
-      "Use the cost model formulas to reason algebraically about optimal "
-      "values. "
-      "When satisfied with your exploration, call submit_final_answer with "
-      "your "
-      "best choice and reasoning.";
+      "Optimize this symbolic cost function by PURE MATHEMATICAL ANALYSIS.\n\n"
+      "Do NOT try random tile sizes. Every call to evaluate_cost must be because "
+      "you mathematically predict it will improve on the best result so far.\n\n"
+      "Process:\n"
+      "1. Deeply analyze the cost formula - which terms dominate?\n"
+      "2. Trace each tile size parameter through the formula - how does it "
+      "scale each dominant term?\n"
+      "3. Identify the mathematical minimum based on how the formula scales\n"
+      "4. PREDICT the optimal tile sizes purely from formula analysis\n"
+      "5. If you want to test a value with evaluate_cost, state clearly why "
+      "your mathematical analysis says it should be better\n"
+      "6. After each result, refine your understanding of the formula\n"
+      "7. Call submit_final_answer only when mathematically certain you have "
+      "the optimum\n\n"
+      "Reason mathematically. Only evaluate costs you predict will improve.";
   messages.push_back(user_msg);
 
   // Tool-use loop
@@ -495,7 +499,7 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(
     llvm::ArrayRef<TileSizeInfo> analyses) {
   std::stringstream ss;
   ss << "You are a compiler optimization expert tasked with selecting optimal "
-        "tile sizes for loop tiling.\n\n";
+        "tile sizes for loop tiling through mathematical analysis.\n\n";
 
   ss << "=== SYMBOLIC COST MODEL ===\n";
   ss << "You have a symbolic cost function that accepts tile size parameters "
@@ -505,13 +509,31 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(
   ss << "The cost function is:\n\n";
   ss << symbolic_cost_function_ << "\n\n";
 
+  ss << "=== MATHEMATICAL ANALYSIS STRATEGY ===\n";
+  ss << "CRITICAL: Only call evaluate_cost if you have a mathematical reason to "
+        "believe it will improve latency.\n";
+  ss << "For EVERY evaluate_cost call and final answer, provide mathematical "
+        "reasoning:\n";
+  ss << "1. Analyze the cost expression algebraically - identify which terms "
+        "dominate (critical path)\n";
+  ss << "2. For each tile size (s0, s1, ...), trace how it appears in the "
+        "formula - is it linear, quadratic, divisor, etc.?\n";
+  ss << "3. Predict mathematically: how will increasing/decreasing each parameter "
+        "affect the dominant terms?\n";
+  ss << "4. BEFORE calling evaluate_cost: State your hypothesis about which "
+        "assignment should be better and why (based on formula analysis)\n";
+  ss << "5. Only call evaluate_cost if you predict it will beat the current best "
+        "based on your term analysis\n";
+  ss << "6. After seeing results, if prediction was wrong, explain why your "
+        "mathematical analysis was incorrect\n";
+  ss << "7. When submitting final answer, prove mathematically why this minimizes "
+        "the dominant terms\n\n";
+
   ss << "=== EVALUATION TOOL ===\n";
   ss << "Use the 'evaluate_cost' tool to test tile size assignments:\n";
   ss << "1. Takes an array of tile-size values (s0, s1, ...)\n";
   ss << "2. Evaluates the symbolic cost function with those concrete values\n";
-  ss << "3. Returns the final latency in seconds\n";
-  ss << "4. Analyze the formula structure to reason about which tile sizes "
-        "minimize latency\n\n";
+  ss << "3. Returns the final latency in seconds\n\n";
 
   ss << "Tiling Decision Points:\n";
   for (size_t i = 0; i < analyses.size(); ++i) {
