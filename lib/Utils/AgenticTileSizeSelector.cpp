@@ -56,9 +56,185 @@ AgenticTileSizeSelector::AgenticTileSizeSelector(
     : api_key_(api_key),
       ktdf_bindings_dir_(ktdf_bindings_dir),
       cost_model_path_(cost_model_path),
-      debug_(debug) {}
+      debug_(debug),
+      num_tile_sizes_(0) {}
 
 AgenticTileSizeSelector::~AgenticTileSizeSelector() = default;
+
+bool AgenticTileSizeSelector::generateSymbolicCostModel(
+    mlir::ModuleOp module,
+    const std::string& ir_str,
+    llvm::ArrayRef<TileSizeInfo> analyses) {
+  // Write IR to temp file
+  llvm::SmallString<256> temp_file;
+  std::error_code ec = llvm::sys::fs::createTemporaryFile("symbolic_cost", "mlir", temp_file);
+  if (ec) {
+    llvm::errs() << "Failed to create temp file for symbolic cost model\n";
+    return false;
+  }
+
+  std::ofstream f(temp_file.c_str());
+  f << ir_str;
+  f.close();
+
+  // Invoke samm-ktdf to generate symbolic cost model (automatically generated when tile sizes are unresolved)
+  std::string cmd = "cd '" + cost_model_path_ + "' && source samm_env/bin/activate && python3.12 main.py --mlir-bindings-dir '" +
+                    ktdf_bindings_dir_ + "' --input-file '" + std::string(temp_file.c_str()) + "'";
+
+  std::string output_file;
+  llvm::SmallString<256> temp_out;
+  ec = llvm::sys::fs::createTemporaryFile("symbolic_out", "txt", temp_out);
+  if (ec) {
+    llvm::sys::fs::remove(temp_file);
+    return false;
+  }
+  output_file = std::string(temp_out.c_str());
+
+  // Execute command
+  std::string full_cmd = cmd + " > " + output_file + " 2>&1";
+  int ret_code = system(full_cmd.c_str());
+
+  // Read output
+  std::string output_content;
+  std::ifstream output_stream(output_file.c_str());
+  if (output_stream.is_open()) {
+    output_content = std::string((std::istreambuf_iterator<char>(output_stream)),
+                                 std::istreambuf_iterator<char>());
+    output_stream.close();
+  }
+
+  llvm::sys::fs::remove(output_file);
+  llvm::sys::fs::remove(temp_file);
+
+  if (ret_code != 0) {
+    llvm::errs() << "Symbolic cost model generation failed:\n" << output_content << "\n";
+    return false;
+  }
+
+  // Check if model.py was generated
+  std::string model_py_path = cost_model_path_ + "/latency_model/model.py";
+  std::ifstream model_file(model_py_path);
+  if (!model_file.is_open()) {
+    llvm::errs() << "model.py not generated at " << model_py_path << "\n";
+    return false;
+  }
+
+  // Read the generated model.py
+  std::stringstream model_buffer;
+  model_buffer << model_file.rdbuf();
+  std::string original_function = model_buffer.str();
+  model_file.close();
+
+  // Store the cost function for display in the prompt (don't modify it)
+  symbolic_cost_function_ = original_function;
+
+  // Determine number of tile sizes from function signature
+  std::regex sig_regex(R"(def\s+latency_function\s*\(\s*([^)]+)\s*\))");
+  std::smatch match;
+  if (std::regex_search(original_function, match, sig_regex)) {
+    std::string params = match[1];
+    num_tile_sizes_ = std::count(params.begin(), params.end(), ',') + 1;
+  } else {
+    llvm::errs() << "Could not parse latency_function signature\n";
+    return false;
+  }
+
+  return true;
+}
+
+std::string AgenticTileSizeSelector::instrumentPythonCostFunction(
+    const std::string& original_function) {
+  // Find the return statement and modify it to return a dict with all variables
+  std::string instrumented = original_function;
+
+  // Replace "return p_0" with a dict return that includes all locals
+  std::string old_return = "    return p_0";
+  std::string new_return = R"(    result_vars = {}
+    for var_name in dir():
+        if var_name.startswith('x') or var_name == 'p_0':
+            try:
+                result_vars[var_name] = locals()[var_name]
+            except:
+                pass
+    return {"latency": p_0, "variables": result_vars})";
+
+  size_t pos = instrumented.find(old_return);
+  if (pos != std::string::npos) {
+    instrumented.replace(pos, old_return.length(), new_return);
+  }
+
+  return instrumented;
+}
+
+AgenticTileSizeSelector::CostEvaluation AgenticTileSizeSelector::evaluateSymbolicCostFunction(
+    const std::vector<int64_t>& tile_sizes) {
+  if (tile_sizes.size() != (size_t)num_tile_sizes_) {
+    return {false, 0.0, {}, "Tile size count mismatch"};
+  }
+
+  // Create a temporary Python script that imports and calls the function
+  llvm::SmallString<256> temp_py;
+  std::error_code ec = llvm::sys::fs::createTemporaryFile("eval_cost", "py", temp_py);
+  if (ec) {
+    return {false, 0.0, {}, "Failed to create temp Python file"};
+  }
+
+  std::ofstream py_file(temp_py.c_str());
+  py_file << "import sys\n";
+  py_file << "sys.path.insert(0, '" << cost_model_path_ << "/latency_model')\n";
+  py_file << "from model import latency_function\n";
+  py_file << "result = latency_function(";
+  for (size_t i = 0; i < tile_sizes.size(); ++i) {
+    if (i > 0) py_file << ", ";
+    py_file << tile_sizes[i];
+  }
+  py_file << ")\n";
+  py_file << "print(f'{result:.15e}')\n";
+  py_file.close();
+
+  // Execute the Python script
+  std::string cmd = "cd '" + cost_model_path_ + "' && source samm_env/bin/activate && python3.12 " + std::string(temp_py.c_str());
+
+  std::string output_file;
+  llvm::SmallString<256> temp_out;
+  ec = llvm::sys::fs::createTemporaryFile("eval_out", "txt", temp_out);
+  if (ec) {
+    llvm::sys::fs::remove(temp_py);
+    return {false, 0.0, {}, "Failed to create output temp file"};
+  }
+  output_file = std::string(temp_out.c_str());
+
+  std::string full_cmd = cmd + " > " + output_file + " 2>&1";
+  int ret_code = system(full_cmd.c_str());
+
+  // Read output
+  std::string output_content;
+  std::ifstream output_stream(output_file.c_str());
+  if (output_stream.is_open()) {
+    output_content = std::string((std::istreambuf_iterator<char>(output_stream)),
+                                 std::istreambuf_iterator<char>());
+    output_stream.close();
+  }
+
+  llvm::sys::fs::remove(temp_py);
+  llvm::sys::fs::remove(output_file);
+
+  if (ret_code != 0) {
+    return {false, 0.0, {}, "Cost function evaluation failed: " + output_content};
+  }
+
+  // Parse latency value from output
+  double latency = 0.0;
+  char* end_ptr = nullptr;
+  latency = std::strtod(output_content.c_str(), &end_ptr);
+  if (end_ptr == output_content.c_str() || latency == 0.0) {
+    return {false, 0.0, {}, "Failed to parse latency value: " + output_content};
+  }
+
+  // For now, return empty variables map (can be enhanced later)
+  std::map<std::string, double> variables;
+  return {true, latency, variables, ""};
+}
 
 std::vector<int64_t> AgenticTileSizeSelector::run(
     mlir::ModuleOp module, llvm::ArrayRef<TileSizeInfo> analyses) {
@@ -76,6 +252,19 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
   // Compute loop granularities once
   computeLoopGranularities(analyses);
 
+  // Print IR to string for symbolic cost model generation
+  std::string ir_str;
+  llvm::raw_string_ostream ir_stream(ir_str);
+  module.print(ir_stream);
+  ir_stream.flush();
+
+  // Generate symbolic cost model from original IR
+  llvm::errs() << "[Agent] Generating symbolic cost model...\n";
+  if (!generateSymbolicCostModel(module, ir_str, analyses)) {
+    llvm::report_fatal_error("Failed to generate symbolic cost model");
+  }
+  llvm::errs() << "[Agent] Symbolic cost model generated with " << num_tile_sizes_ << " tile size parameters\n";
+
   std::string system_prompt = buildSystemPrompt(analyses);
   std::string tool_schemas = buildToolSchemas();
 
@@ -83,11 +272,12 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
   json user_msg;
   user_msg["role"] = "user";
   user_msg["content"] =
-      "You are optimizing tile sizes for a compiler. Use the "
-      "transform_and_evaluate_cost "
-      "tool to explore different tile-size assignments, and when satisfied, "
-      "call "
-      "submit_final_answer with your best choice and reasoning.";
+      "You are optimizing a symbolic cost function to find tile size values that "
+      "minimize latency. Use the evaluate_cost tool to test different tile size "
+      "assignments and understand how intermediate variables affect the result. "
+      "Use the cost model formulas to reason algebraically about optimal values. "
+      "When satisfied with your exploration, call submit_final_answer with your "
+      "best choice and reasoning.";
   messages.push_back(user_msg);
 
   // Tool-use loop
@@ -127,22 +317,23 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
           if (tool_name == "submit_final_answer") {
             // Extract final answer
             json input = block["input"];
-            std::vector<int64_t> result(analyses.size());
+            std::vector<int64_t> result;
 
-            for (const auto& ts : input["tile_sizes"]) {
-              int64_t id = ts["id"];
-              int64_t tile_size = ts["tile_size"];
-
-              if (id < 0 || id >= (int64_t)analyses.size()) {
-                llvm::report_fatal_error(
-                    llvm::Twine("Final answer references invalid id: ") +
-                    std::to_string(id));
+            // Parse tile_sizes as direct integers (s0, s1, ...)
+            for (const auto& tile_size : input["tile_sizes"]) {
+              if (tile_size.is_number()) {
+                result.push_back(tile_size.get<int64_t>());
               }
-              result[id] = tile_size;
             }
 
-            // Validate each tile size
-            for (size_t i = 0; i < analyses.size(); ++i) {
+            if (result.size() != (size_t)num_tile_sizes_) {
+              llvm::report_fatal_error(
+                  llvm::Twine("Final answer has ") + std::to_string(result.size()) +
+                  " tile sizes but expected " + std::to_string(num_tile_sizes_));
+            }
+
+            // Validate each tile size (map s0, s1, ... to analysis indices)
+            for (size_t i = 0; i < result.size() && i < analyses.size(); ++i) {
               auto& analysis = const_cast<TileSizeInfo&>(analyses[i]);
               int64_t tile_size = result[i];
               int64_t min_value =
@@ -152,17 +343,34 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
 
               if (tile_size < min_value) {
                 llvm::report_fatal_error(
-                    llvm::Twine("Final tile size for op ") + std::to_string(i) +
+                    llvm::Twine("Final tile size s") + std::to_string(i) +
                     " is " + std::to_string(tile_size) + " but minimum is " +
                     std::to_string(min_value));
               }
 
               if (tile_size % divisibility != 0) {
                 llvm::report_fatal_error(
-                    llvm::Twine("Final tile size for op ") + std::to_string(i) +
+                    llvm::Twine("Final tile size s") + std::to_string(i) +
                     " is " + std::to_string(tile_size) +
                     " but must be divisible by " +
                     std::to_string(divisibility));
+              }
+
+              // Check granularity constraint
+              int64_t granularity = 1;
+              for (const auto& loop_info : analysis.associated_loops) {
+                auto it = loop_granularities_.find(loop_info.loop);
+                if (it != loop_granularities_.end()) {
+                  granularity = it->second;
+                  break;
+                }
+              }
+              if (granularity > 1 && tile_size % granularity != 0) {
+                llvm::report_fatal_error(
+                    llvm::Twine("Final tile size s") + std::to_string(i) +
+                    " is " + std::to_string(tile_size) +
+                    " but must be divisible by " + std::to_string(granularity) +
+                    " (parallel region constraint)");
               }
             }
 
@@ -177,37 +385,46 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
             }
 
             return result;
-          } else if (tool_name == "transform_and_evaluate_cost") {
-            // Execute tool
+          } else if (tool_name == "evaluate_cost") {
+            // Execute symbolic cost evaluation
             json input = block["input"];
-            std::vector<std::pair<int64_t, int64_t>> tile_size_assignments;
+            std::vector<int64_t> tile_sizes;
 
+            // Parse tile_sizes as direct integers
             for (const auto& ts : input["tile_sizes"]) {
-              int64_t id = ts["id"];
-              int64_t tile_size = ts["tile_size"];
-              tile_size_assignments.push_back({id, tile_size});
+              if (ts.is_number()) {
+                tile_sizes.push_back(ts.get<int64_t>());
+              }
             }
 
             std::string reasoning = input["reasoning"].get<std::string>();
 
-            // Print what we're trying before executing
-            llvm::errs() << "[Agent] Trying: ";
-            for (size_t i = 0; i < tile_size_assignments.size(); ++i) {
-              llvm::errs() << (i > 0 ? ", " : "")
-                           << tile_size_assignments[i].second;
+            // Print what we're trying
+            llvm::errs() << "[Agent] Evaluating: ";
+            for (size_t i = 0; i < tile_sizes.size(); ++i) {
+              llvm::errs() << (i > 0 ? ", " : "") << tile_sizes[i];
             }
             llvm::errs() << "\n";
 
-            auto result = handleTransformAndEvaluateCost(module, analyses,
-                                                         tile_size_assignments);
+            auto eval_result = evaluateSymbolicCostFunction(tile_sizes);
 
             llvm::errs() << "Reasoning: " << reasoning << "\n";
-            if (result.success) {
+            if (eval_result.success) {
               std::ostringstream latency_str;
-              latency_str << std::setprecision(15) << result.latency;
+              latency_str << std::setprecision(15) << eval_result.latency;
               llvm::errs() << "Latency: " << latency_str.str() << " sec\n";
+
+              // Log intermediate variables
+              if (!eval_result.variables.empty()) {
+                llvm::errs() << "Intermediate variables:\n";
+                for (const auto& [var_name, var_value] : eval_result.variables) {
+                  std::ostringstream var_oss;
+                  var_oss << std::setprecision(10) << var_value;
+                  llvm::errs() << "  " << var_name << " = " << var_oss.str() << "\n";
+                }
+              }
             } else {
-              llvm::errs() << "Error: " << result.error_message << "\n";
+              llvm::errs() << "Error: " << eval_result.error_message << "\n";
             }
 
             // Add assistant message with tool_use
@@ -226,13 +443,13 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
             json tool_result;
             tool_result["type"] = "tool_result";
             tool_result["tool_use_id"] = block["id"];
-            if (result.success) {
-              // Format with full precision
+
+            if (eval_result.success) {
               std::ostringstream oss;
-              oss << std::setprecision(15) << result.latency;
+              oss << std::setprecision(15) << eval_result.latency;
               tool_result["content"] = "Latency: " + oss.str() + " sec";
             } else {
-              tool_result["content"] = "Error: " + result.error_message;
+              tool_result["content"] = "Error: " + eval_result.error_message;
               tool_result["is_error"] = true;
             }
             user_content.push_back(tool_result);
@@ -259,15 +476,18 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(
   ss << "You are a compiler optimization expert tasked with selecting optimal "
         "tile sizes for loop tiling.\n\n";
 
-  ss << "You have access to a tool called transform_and_evaluate_cost that:\n";
-  ss << "1. Takes an array of tile-size assignments (id -> tile_size)\n";
-  ss << "2. Applies tiling to the IR (replaces reserve_size placeholders with "
-        "constants)\n";
-  ss << "3. Passes to SAMM cost model which:\n";
-  ss << "   - Parses the IR to extract operations and memory access patterns\n";
-  ss << "   - Builds a schedule tree with pipelined stages and dependencies\n";
-  ss << "   - Computes total bytes and ops for each tile size configuration\n";
-  ss << "4. Returns the measured latency in seconds\n\n";
+  ss << "=== SYMBOLIC COST MODEL ===\n";
+  ss << "You have a symbolic cost function that accepts tile size parameters (s0, s1, ...) "
+        "and computes latency through a series of intermediate expressions (x0, x1, ..., x55).\n\n";
+  ss << "The cost function is:\n\n";
+  ss << symbolic_cost_function_ << "\n\n";
+
+  ss << "=== EVALUATION TOOL ===\n";
+  ss << "Use the 'evaluate_cost' tool to test tile size assignments:\n";
+  ss << "1. Takes an array of tile-size values (s0, s1, ...)\n";
+  ss << "2. Evaluates the symbolic cost function with those concrete values\n";
+  ss << "3. Returns the final latency in seconds\n";
+  ss << "4. Analyze the formula structure to reason about which tile sizes minimize latency\n\n";
 
   ss << "Tiling Decision Points:\n";
   for (size_t i = 0; i < analyses.size(); ++i) {
@@ -299,8 +519,7 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(
   }
 
   ss << "\n=== INITIAL HEURISTIC ===\n";
-  ss << "A baseline greedy heuristic selects tile sizes "
-        "as follows:\n";
+  ss << "A baseline greedy heuristic selects tile sizes as follows:\n";
   ss << "For each tiling decision point ID (independently):\n";
   ss << "1. Start with candidate = max(2, min_value)\n";
   ss << "2. Iterate candidate downward to min_value (stepping by 1)\n";
@@ -310,23 +529,15 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(
   ss << "   (i.e., for each associated loop, verify: total_size % candidate == "
         "0)\n";
   ss << "5. Return the HIGHEST (first) valid candidate that satisfies all "
-        "constraints\n";
-  ss << "This heuristic prioritizes larger tile sizes (fewer iterations) "
-        "within constraints.\n";
-  ss << "YOUR FIRST CALL should evaluate the heuristic-selected tile sizes to "
+        "constraints\n"
+     << "This heuristic prioritizes larger tile sizes (fewer iterations) "
+        "within constraints.\n"
+     << "YOUR FIRST CALL should evaluate the heuristic-selected tile sizes to "
         "establish baseline latency.\n\n";
 
   ss << "Your Task:\n";
-  ss << "1. First, apply the heuristic algorithm to compute initial tile size "
-        "for each decision point\n";
-  ss << "2. Call transform_and_evaluate_cost with these heuristic-selected "
-        "tile sizes\n";
-  ss << "3. Then explore tile size space systematically to find configurations "
-        "with better latency\n";
-  ss << "4. Use the cost model formulas to reason about latency "
-        "relationships\n";
-  ss << "5. When satisfied with your exploration, submit your best found "
-        "configuration\n";
+  ss << "Find the tile sizes that minimize latency. Use evaluate_cost to test assignments.\n";
+  ss << "When satisfied, submit your final answer.\n";
 
   ss << "Constraints:\n";
   ss << "- Each tile size must be >= min_value\n";
@@ -357,44 +568,37 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(
 std::string AgenticTileSizeSelector::buildToolSchemas() {
   json schemas = json::array();
 
-  // transform_and_evaluate_cost tool
-  json transform_tool;
-  transform_tool["name"] = "transform_and_evaluate_cost";
-  transform_tool["description"] =
-      "Apply tile-size assignments to the IR and measure latency via SAMM cost "
-      "model";
-  transform_tool["input_schema"] = {
+  // evaluate_cost tool
+  json evaluate_tool;
+  evaluate_tool["name"] = "evaluate_cost";
+  evaluate_tool["description"] =
+      "Evaluate the symbolic cost function with given tile size assignments. Returns "
+      "final latency and all intermediate variable values.";
+  evaluate_tool["input_schema"] = {
       {"type", "object"},
       {"properties",
        {{"tile_sizes",
          {{"type", "array"},
-          {"items",
-           {{"type", "object"},
-            {"properties",
-             {{"id", {{"type", "integer"}}},
-              {"tile_size", {{"type", "integer"}}}}},
-            {"required", {"id", "tile_size"}}}}}},
+          {"items", {{"type", "integer"}}},
+          {"description", "Tile sizes for parameters s0, s1, ... in order"}}},
         {"reasoning", {{"type", "string"}}}}},
       {"required", {"tile_sizes", "reasoning"}}};
-  schemas.push_back(transform_tool);
+  schemas.push_back(evaluate_tool);
 
   // submit_final_answer tool
   json submit_tool;
   submit_tool["name"] = "submit_final_answer";
   submit_tool["description"] =
-      "Submit your final tile-size assignment once satisfied";
-  submit_tool["input_schema"] = {{"type", "object"},
-                                 {"properties",
-                                  {{"tile_sizes",
-                                    {{"type", "array"},
-                                     {"items",
-                                      {{"type", "object"},
-                                       {"properties",
-                                        {{"id", {{"type", "integer"}}},
-                                         {"tile_size", {{"type", "integer"}}}}},
-                                       {"required", {"id", "tile_size"}}}}}},
-                                   {"explanation", {{"type", "string"}}}}},
-                                 {"required", {"tile_sizes", "explanation"}}};
+      "Submit your final tile-size assignment once satisfied. Provide values for s0, s1, ... in order.";
+  submit_tool["input_schema"] = {
+      {"type", "object"},
+      {"properties",
+       {{"tile_sizes",
+         {{"type", "array"},
+          {"items", {{"type", "integer"}}},
+          {"description", "Tile sizes for parameters s0, s1, ... in order"}}},
+        {"explanation", {{"type", "string"}}}}},
+      {"required", {"tile_sizes", "explanation"}}};
   schemas.push_back(submit_tool);
 
   return schemas.dump();

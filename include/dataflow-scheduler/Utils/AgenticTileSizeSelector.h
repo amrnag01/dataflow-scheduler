@@ -56,6 +56,9 @@ class AgenticTileSizeSelector {
   std::string ktdf_bindings_dir_;
   std::string cost_model_path_;
   bool debug_;
+  std::string cost_model_source_;  // Full source code of the cost model
+  std::string symbolic_cost_function_;  // Python source of symbolic cost function
+  int num_tile_sizes_;  // Number of tile size parameters (s0, s1, ...)
 
   // Maps each loop to the LCM of num_instances of parallel regions in its body
   std::map<mlir::scf::ForOp, int64_t> loop_granularities_;
@@ -73,7 +76,25 @@ class AgenticTileSizeSelector {
       const std::vector<std::pair<int64_t, int64_t>>& tile_size_assignments,
       std::string& error_message);
 
-  // Tool execution
+  // Symbolic cost model generation and evaluation
+  bool generateSymbolicCostModel(
+      mlir::ModuleOp module,
+      const std::string& ir_str,
+      llvm::ArrayRef<TileSizeInfo> analyses);
+
+  std::string instrumentPythonCostFunction(const std::string& original_function);
+
+  struct CostEvaluation {
+    bool success;
+    double latency;
+    std::map<std::string, double> variables;  // All intermediate variables
+    std::string error_message;
+  };
+
+  CostEvaluation evaluateSymbolicCostFunction(
+      const std::vector<int64_t>& tile_sizes);
+
+  // Tool execution (old approach - may deprecate)
   struct TransformResult {
     bool success;
     double latency;  // only valid if success
