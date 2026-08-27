@@ -47,6 +47,11 @@
 // CHECK-NEXT:   address-assignment
 // CHECK-NEXT:   normalize-grid-to-1d
 // CHECK-NEXT:   ktdf-to-ktdflowering
+// CHECK-NEXT:   builtin.module(
+// CHECK-NEXT:   func.func(
+// CHECK-NEXT:   ktdfarch-apply-patterns{groups={post_lowering}}
+// CHECK-NEXT:   )
+// CHECK-NEXT:   )
 // CHECK-NEXT:   ktdflowering-to-dfir
 // CHECK-NEXT:   wrap-program-dfir
 // CHECK-NEXT:   emit-split-dfir

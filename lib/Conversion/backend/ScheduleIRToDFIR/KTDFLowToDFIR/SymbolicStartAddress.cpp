@@ -238,11 +238,7 @@ SymbolAllocator::SymbolAllocator(mlir::ModuleOp top) {
   next_derived_ = next_input_;
 }
 
-std::pair<int64_t, bool> SymbolAllocator::derivedIdFor(
-    mlir::Value root, int64_t displacement, llvm::ArrayRef<int64_t> terms,
-    int64_t word_size) {
-  const DerivedKey key{root, displacement, llvm::SmallVector<int64_t>(terms),
-                       word_size};
+std::pair<int64_t, bool> SymbolAllocator::derivedIdFor(const DerivedKey& key) {
   const auto found = derived_.find(key);
   if (found != derived_.end()) return {found->second, false};
   if (next_derived_ == std::numeric_limits<int64_t>::min())
@@ -410,6 +406,27 @@ scheduler::takeSymbolicAddressApart(mlir::Value address,
 
 namespace {
 
+/// Gets the key identifying the address \p taken, \p terms, \p displacement and
+/// \p word_size describe, over the first \p through steps of the expression --
+/// a step of it rather than the whole, where the step needs a symbol of its
+/// own.
+DerivedKey keyFor(const SymbolicAddress& taken, llvm::ArrayRef<int64_t> terms,
+                  int64_t displacement, int64_t word_size, size_t through) {
+  DerivedKey key;
+  key.root = taken.root;
+  key.offset = displacement;
+  key.terms.assign(terms.begin(), terms.end());
+  key.word_size = word_size;
+  for (mlir::Operation* op :
+       llvm::ArrayRef<mlir::Operation*>(taken.expression).take_front(through)) {
+    llvm::SmallVector<std::optional<int64_t>, 2> operands;
+    for (mlir::Value operand : op->getOperands())
+      operands.push_back(mlir::getConstantIntValue(operand));
+    key.expression.push_back({op->getName(), std::move(operands)});
+  }
+  return key;
+}
+
 /// Rebuilds \p taken's expression with each per-grid leaf replaced by the
 /// constant \p terms gives it, adds \p displacement, declares the result as a
 /// symbol of its own and returns that symbol's id.
@@ -449,7 +466,7 @@ int64_t declareDerived(const SymbolicAddress& taken,
   // would leave a symbol declared on a value nothing computes, which reads back
   // as a symbol with no definition at all.
   mlir::Value result = taken.root;
-  for (mlir::Operation* op : taken.expression) {
+  for (auto [index, op] : llvm::enumerate(taken.expression)) {
     mlir::Operation* clone = builder.clone(*op, mapping);
     llvm::SmallVector<mlir::Value> folded;
     if (mlir::succeeded(builder.tryFold(clone, folded)) && !folded.empty()) {
@@ -458,6 +475,29 @@ int64_t declareDerived(const SymbolicAddress& taken,
       continue;
     }
     result = note(clone->getResult(0));
+
+    // A definition is one operator over symbols and constants, so a step read
+    // by another step needs a symbol of its own to be read as an operand. The
+    // last step needs none: what follows it reads it as part of a single
+    // definition --
+    // `(x + y) / word` -- or is the symbol below.
+    const bool last = index + 1 == taken.expression.size();
+    const bool read_by_what_follows =
+        displacement == 0 &&
+        (word_size == 1 ||
+         mlir::isa<mlir::arith::AddIOp, mlir::arith::SubIOp>(clone));
+    if (last && read_by_what_follows) continue;
+
+    // On this rebuild of the step even where the id is not fresh: two addresses
+    // sharing a step share its id, but each rebuilds it, and what the next step
+    // reads is this rebuild.
+    const int64_t step = symbols
+                             .derivedIdFor(keyFor(taken, terms,
+                                                  /*displacement=*/0,
+                                                  /*word_size=*/1, index + 1))
+                             .first;
+    built.push_back(mlir::symbol::CreateIdOp::create(builder, loc, result, step)
+                        .getOperation());
   }
   if (displacement != 0) {
     mlir::Value by =
@@ -475,8 +515,8 @@ int64_t declareDerived(const SymbolicAddress& taken,
       discardBuilt();
       return taken.input;
     }
-    const auto [id, fresh] =
-        symbols.derivedIdFor(taken.root, displacement, terms, word_size);
+    const auto [id, fresh] = symbols.derivedIdFor(
+        keyFor(taken, terms, displacement, word_size, taken.expression.size()));
     // Declared once. A second declaration of the same id would leave two
     // symbols meaning one address, so what was built to get here is thrown away
     // instead.
@@ -492,8 +532,8 @@ int64_t declareDerived(const SymbolicAddress& taken,
   // inputs over as byte addresses, so the symbol a program reads is the byte
   // address divided by that -- last, after everything else the address is built
   // from.
-  const auto [id, fresh] =
-      symbols.derivedIdFor(taken.root, displacement, terms, word_size);
+  const auto [id, fresh] = symbols.derivedIdFor(
+      keyFor(taken, terms, displacement, word_size, taken.expression.size()));
   if (!fresh) {
     discardBuilt();
     return id;

@@ -75,11 +75,13 @@
 
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Location.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/Value.h"
 
 namespace scheduler {
@@ -99,19 +101,66 @@ namespace scheduler {
 /// for the inputs, and to leave everything this allocator handed out alone. The
 /// declarations this writes into the IR are what say so: a consumer reads the
 /// ids rather than working them out again.
-/// What identifies a derived address: the input it is rooted at, the offset
-/// added to it, the constants its per-unit operands take, and the word size it
-/// is divided by. The word size is part of it because one tensor read through
-/// units that address in different word sizes is two different numbers.
+/// One step of the expression a derived address is built by: which operation it
+/// is, and which of its operands are constants.
+///
+/// Not the operation itself. Two program units running one tensor's address are
+/// two copies of the same arithmetic, so an `Operation*` would make them two
+/// addresses and hand out a symbol each -- and the copies are erased once a
+/// symbol stands for them, leaving the key pointing at freed memory.
+/// `OperationName` is interned by the context, so it compares and hashes as a
+/// pointer and outlives the IR the key was built from.
+struct ExpressionStep {
+  mlir::OperationName op;
+  /// One entry per operand, in operand order: the constant it carries, or
+  /// std::nullopt where it carries none. In order because the order is part of
+  /// the address -- `root - 5` and `5 - root` are two different ones.
+  llvm::SmallVector<std::optional<int64_t>, 2> operands;
+
+  bool operator==(const ExpressionStep& other) const {
+    return op == other.op && operands == other.operands;
+  }
+};
+
+/// So that a DerivedKey's expression can be hashed with the rest of it.
+inline llvm::hash_code hash_value(const ExpressionStep& step) {
+  llvm::hash_code hash = mlir::hash_value(step.op);
+  for (const std::optional<int64_t>& operand : step.operands)
+    hash = llvm::hash_combine(hash, operand.has_value(), operand.value_or(0));
+  return hash;
+}
+
+/// What identifies a derived address: the input it is rooted at, the expression
+/// over it, the offset added to it, the constants its per-unit operands take,
+/// and the word size it is divided by. The word size is part of it because one
+/// tensor read through units that address in different word sizes is two
+/// different numbers.
 struct DerivedKey {
   mlir::Value root;
   int64_t offset = 0;
   llvm::SmallVector<int64_t> terms;
   int64_t word_size = 1;
+  /// The steps the address is built from the input by, outermost last. What
+  /// tells two addresses apart that agree in root, offset, terms and word size.
+  ///
+  /// `(1024 + (tile * 6 + row) * 4096) * 2`, for a row the run hands in taken
+  /// to a grid element's slab of a tensor the compiler placed at 1024, is:
+  ///
+  /// ```
+  ///   arith.muli  [_, 6]      the grid element's share, in rows
+  ///   arith.addi  [_, _]      displaced by the row the run hands in
+  ///   arith.muli  [_, 4096]   rows to elements
+  ///   arith.addi  [1024, _]   the address the compiler picked
+  ///   arith.muli  [_, 2]      elements to bytes
+  /// ```
+  ///
+  /// A second tensor read the same way differs in that 1024 and nothing else.
+  llvm::SmallVector<ExpressionStep> expression;
 
   bool operator==(const DerivedKey& other) const {
     return root == other.root && offset == other.offset &&
-           terms == other.terms && word_size == other.word_size;
+           terms == other.terms && word_size == other.word_size &&
+           expression == other.expression;
   }
 };
 
@@ -148,16 +197,14 @@ class SymbolAllocator {
   /// are in general two different tensors.
   std::optional<int64_t> inputSymbolIdFor(mlir::Value address) const;
 
-  /// Returns the id for the symbol derived from \p root by \p displacement,
-  /// \p terms and \p word_size, and whether that id is newly handed out.
+  /// Returns the id for the symbol \p key describes, and whether that id is
+  /// newly handed out.
   ///
   /// The same address asked for twice gets the same id. One
   /// `ktdp.construct_memory_view` is copied into every unit the program runs
   /// on, so without this one tensor's address would become as many symbols as
   /// there are units, all meaning the same thing and each resolved separately.
-  std::pair<int64_t, bool> derivedIdFor(mlir::Value root, int64_t displacement,
-                                        llvm::ArrayRef<int64_t> terms,
-                                        int64_t word_size);
+  std::pair<int64_t, bool> derivedIdFor(const DerivedKey& key);
 
   /// How many inputs the run takes, i.e. how many ids are the inputs' own.
   int64_t numInputs() const { return -next_input_ - 1; }
@@ -284,14 +331,15 @@ namespace llvm {
 template <>
 struct DenseMapInfo<scheduler::DerivedKey> {
   static scheduler::DerivedKey getEmptyKey() {
-    return {DenseMapInfo<mlir::Value>::getEmptyKey(), 0, {}};
+    return {DenseMapInfo<mlir::Value>::getEmptyKey(), 0, {}, 1, {}};
   }
   static scheduler::DerivedKey getTombstoneKey() {
-    return {DenseMapInfo<mlir::Value>::getTombstoneKey(), 0, {}};
+    return {DenseMapInfo<mlir::Value>::getTombstoneKey(), 0, {}, 1, {}};
   }
   static unsigned getHashValue(const scheduler::DerivedKey& key) {
-    return static_cast<unsigned>(hash_combine(
-        key.root, key.offset, hash_combine_range(key.terms), key.word_size));
+    return static_cast<unsigned>(
+        hash_combine(key.root, key.offset, hash_combine_range(key.terms),
+                     key.word_size, hash_combine_range(key.expression)));
   }
   static bool isEqual(const scheduler::DerivedKey& lhs,
                       const scheduler::DerivedKey& rhs) {

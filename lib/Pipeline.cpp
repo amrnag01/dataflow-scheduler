@@ -117,8 +117,8 @@ void scheduler::buildDFIRBackendPipeline(
   //     the execution unit program scopes.
   //   - The scheduler is down to using memory buffers, but still uses SSA.
   //  -> Apply patterns that produce custom DFIR.
-  // pm.nest<mlir::ModuleOp>().addNestedPass<mlir::func::FuncOp>(
-  //     mlir::ktdf_arch::createApplyPatternsPass({"post_lowering"}));
+  pm.nest<mlir::ModuleOp>().addNestedPass<mlir::func::FuncOp>(
+      mlir::ktdf_arch::createApplyPatternsPass({"post_lowering"}));
 
   pm.addPass(createKTDFLowToDFIRPass());
   // And each program given the two levels it is read at: what it is, and the

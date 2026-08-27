@@ -90,6 +90,10 @@ mlir::scf::ForOp createForOpWithAdditionalIterArgs(mlir::scf::ForOp loop_op,
                                                    mlir::IRMapping& ir_map,
                                                    bool delete_op = true);
 
+/// Erases the ops of \p roots that nothing reads, and whatever they were the
+/// last reader of.
+void eraseDeadAncestorOps(llvm::ArrayRef<mlir::Operation*> roots);
+
 }  // namespace scheduler
 
 #endif  // DATAFLOW_SCHEDULER_TRANSFORMS_UTILS_UTILS_H_

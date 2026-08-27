@@ -27,12 +27,14 @@
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 using namespace scheduler;
 
@@ -239,4 +241,20 @@ mlir::scf::ForOp scheduler::createForOpWithAdditionalIterArgs(
   }
 
   return new_loop;
+}
+
+void scheduler::eraseDeadAncestorOps(llvm::ArrayRef<mlir::Operation*> roots) {
+  llvm::SmallVector<mlir::Operation*> worklist(roots);
+  llvm::DenseSet<mlir::Operation*> erased;
+  while (!worklist.empty()) {
+    mlir::Operation* op = worklist.pop_back_val();
+    // An op reached twice is on the worklist twice, and the second visit would
+    // be to freed memory.
+    if (erased.contains(op) || !mlir::isOpTriviallyDead(op)) continue;
+    for (mlir::Value operand : op->getOperands())
+      if (mlir::Operation* def = operand.getDefiningOp())
+        worklist.push_back(def);
+    erased.insert(op);
+    op->erase();
+  }
 }

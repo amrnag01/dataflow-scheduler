@@ -179,23 +179,28 @@ struct SplitDFIROutputPass
 
     // Build <funcname>.mlir for each impl function with program_unit ops.
     bool found_impl = false;
-    for (auto& op : impl_module.getBodyRegion().front()) {
-      auto func = mlir::dyn_cast<mlir::func::FuncOp>(op);
-      if (!func || !hasProgramUnits(func)) continue;
+    bool write_failed = false;
+    impl_module.walk([&](mlir::func::FuncOp func) {
+      if (!hasProgramUnits(func)) return mlir::WalkResult::advance();
       found_impl = true;
 
       mlir::OwningOpRef<mlir::ModuleOp> impl_mod =
           mlir::ModuleOp::create(builder.getUnknownLoc());
       mlir::OpBuilder ib(impl_mod->getBodyRegion());
-      auto* cloned = ib.clone(op);
+      auto* cloned = ib.clone(*func.getOperation());
       if (auto f = mlir::dyn_cast<mlir::func::FuncOp>(cloned))
         f.setVisibility(mlir::SymbolTable::Visibility::Public);
 
       std::string filename = funcNameToFilename(func.getSymName());
       if (!writeModule(impl_mod.get(), filename)) {
-        signalPassFailure();
-        return;
+        write_failed = true;
+        return mlir::WalkResult::interrupt();
       }
+      return mlir::WalkResult::advance();
+    });
+    if (write_failed) {
+      signalPassFailure();
+      return;
     }
 
     if (!found_impl) {
