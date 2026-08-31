@@ -51,6 +51,7 @@
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchDialect.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Transforms/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLoweringDialect.h"
+#include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLoweringDialect.h"
 #include "dataflow-scheduler/Dialect/Symbol/Symbol.h"
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
@@ -87,6 +88,7 @@ void scheduler::registerDialects(mlir::DialectRegistry& registry) {
                   mlir::ktdf::KTDFDialect,
                   mlir::ktdf_arch::KTDFArchDialect,
                   mlir::ktdf_lowering::KTDFLoweringDialect,
+                  mlir::ktdp_lowering::KTDPLoweringDialect,
                   mlir::symbol::SymbolDialect,
                   mlir::uniform::UniformDialect,
                   mlir::vectorchain::VectorChainDialect>();

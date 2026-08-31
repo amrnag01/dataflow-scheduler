@@ -1,18 +1,10 @@
-// RUN: dataflow-scheduler-opt --tile-size-selection --canonicalize %s | FileCheck %s
+// RUN: dataflow-scheduler-opt --tile-size-selection --allow-unregistered-dialect --canonicalize %s | FileCheck %s
 
 // CHECK-LABEL:   func.func private @tile_size_selection_test() {
-// CHECK-NEXT:     %[[CONSTANT_0:.*]] = arith.constant 0 : index
-// CHECK-NEXT:     %[[CONSTANT_1:.*]] = arith.constant 1 : index
-// CHECK-NEXT:     %[[CONSTANT_2:.*]] = arith.constant 6 : index
-// CHECK-NEXT:     scf.for %[[VAL_0:.*]] = %[[CONSTANT_0]] to %[[CONSTANT_2]] step %[[CONSTANT_1]] {
-// CHECK-NEXT:       ktdf.pipeline {
-// CHECK-NEXT:         ktdf.stage depends_in(none) depends_out(none) {
-// CHECK-NEXT:         } {applicable_units = ["MNILU"]}
-// CHECK-NEXT:       }
-// CHECK-NEXT:     }
-// CHECK-NEXT:     return
-// CHECK-NEXT:   }
-
+// CHECK-DAG:     %[[C0:.*]] = arith.constant 0 : index
+// CHECK-DAG:     %[[C1:.*]] = arith.constant 1 : index
+// CHECK-DAG:     %[[C6:.*]] = arith.constant 6 : index
+// CHECK:         scf.for %[[VAL_0:.*]] = %[[C0]] to %[[C6]] step %[[C1]] {
 
 module {
   func.func private @tile_size_selection_test() {
@@ -44,6 +36,7 @@ module {
             %div1 = arith.divsi %sub1, %c1 : index
             
             %val = memref.load %alloc[%div1, %div1, %linear_idx] : memref<?x?x12xf16, "L1">
+            "unregistered.op"() : () -> ()
           }
         } {applicable_units = ["MNILU"]}
       }

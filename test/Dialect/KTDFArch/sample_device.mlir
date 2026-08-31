@@ -185,16 +185,16 @@ ktdf_arch.device @sample_device {
         %reg = type : memref<f16, "SFU_REG">
         %no_dyn_operands = attribute = array<i32: 0, 0>
 
-        %in_op = operation "memref.alloc"
+        %in_op = operation "memref.alloca"
           {"operandSegmentSizes" = %no_dyn_operands} -> (%reg : !pdl.type)
         %in_reg = result 0 of %in_op
         %in_store = operation "memref.store"
           (%in, %in_reg : !pdl.value, !pdl.value)
 
-        %out_op = operation "memref.alloc"
+        %out_op = operation "memref.alloca"
           {"operandSegmentSizes" = %no_dyn_operands} -> (%reg : !pdl.type)
         %out_reg = result 0 of %out_op
-        %t0_op = operation "memref.alloc"
+        %t0_op = operation "memref.alloca"
           {"operandSegmentSizes" = %no_dyn_operands} -> (%reg : !pdl.type)
         %t0 = result 0 of %t0_op
 

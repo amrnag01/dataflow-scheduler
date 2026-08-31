@@ -1173,7 +1173,8 @@ std::unique_ptr<PathExpansionPlan> planPathExpansion(
       collectOriginalStageResourcePath(sorted_stages, plan.get());
   if (endpoint_path.size() < 2) {
     // Need at least source and destination
-    return nullptr;
+    plan->changed = false;
+    return plan;
   }
 
   // PREP 4: Build full shortest path across architecture graph

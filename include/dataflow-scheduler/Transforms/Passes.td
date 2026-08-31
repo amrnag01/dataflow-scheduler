@@ -295,11 +295,17 @@ def AddressAssignmentPass : Pass<"address-assignment", "mlir::ModuleOp"> {
     them by memory space (L1, DDR), analyses their sizes and assigns addresses.
 
   }];
+
   let constructor = "::scheduler::createAddressAssignmentPass()";
   let dependentDialects = [
       "mlir::ktdf::KTDFDialect",
       "mlir::memref::MemRefDialect",
       "mlir::affine::AffineDialect"];
+
+  let statistics = [
+    Statistic<"num_processed", "num-processed", "Number of processed allocations">,
+    Statistic<"num_failed", "num-failed", "Number of failed allocations">
+  ];
 }
 
 def ScalarBroadcastLegalizationPass
@@ -341,18 +347,20 @@ def EnsureDeviceDeclarationPass
   ];
 }
 
-def HoistRegistersPass : Pass<"hoist-registers", "mlir::ModuleOp"> {
-  let summary = "Move the registers a generic body uses in front of it";
+def MaterializeRegistersPass : Pass<"materialize-registers", "mlir::ModuleOp"> {
+  let summary = "Make the registers a generic body uses real, in front of it";
   let description = [{
-    Visits every nested `linalg.generic` and attempts to hoist out registers
-    (in the form of materialized `memref.alloc` and non-materialized 
-    `arith.constant` with `ktdf_arch.maps_to` attributes).
-    
-    Hoisting requires the cardinality of the `linalg.generic` iteration domain
-    to be statically known, and all consumers of the registers to be either
-    `memref.load`, `memref.store` or `ktdf.opaque`. Hoisted register sizes are
+    Visits every nested `linalg.generic` and makes the registers it uses real
+    in front of it: an allocation the body carries, and an `arith.constant`
+    with a `ktdf_arch.maps_to` attribute, which needs an allocation and a fill
+    of its own.
+
+    This requires the cardinality of the `linalg.generic` iteration domain to
+    be statically known, and all consumers of the registers to be either
+    `memref.load`, `memref.store` or `ktdf.opaque`. Register sizes are
     increased to match the iteration domain, but scalar users remain fixed to
-    the first element of the allocated segment.
+    the first element of the allocated segment. A store of a value the body
+    does not compute per element fills every element instead.
 
     Example:
     ```mlir
@@ -384,6 +392,126 @@ def HoistRegistersPass : Pass<"hoist-registers", "mlir::ModuleOp"> {
     "mlir::ktdf::KTDFDialect",
     "mlir::linalg::LinalgDialect",
     "mlir::memref::MemRefDialect"
+  ];
+}
+
+def ApplyDevicePatternsPass : Pass<"apply-device-patterns", "mlir::func::FuncOp"> {
+  let summary = "Applies patterns defined in the `ktdf_arch.device`";
+  let description = [{
+    Given a root operation that is mapped to a `ktdf_arch.device`, this pass
+    applies all the (enabled groups of) patterns defined within the device to
+    the IR nested below the root operation.
+  }];
+
+  let options = [
+    ListOption<"enabled_groups", "groups", "std::string", 
+      "List of pattern groups to enable, or empty for ungrouped patterns only">
+  ];
+
+  let dependentDialects = [
+    "mlir::agen::AgenDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::func::FuncDialect",
+    "mlir::ktdf_arch::KTDFArchDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::pdl::PDLDialect",
+    "mlir::pdl_interp::PDLInterpDialect",
+    "mlir::vectorchain::VectorChainDialect"
+  ];
+}
+
+def HoistInvariantsPass : Pass<"hoist-invariants", "mlir::func::FuncOp"> {
+  let summary = "Hoist invariants out of pipelines and loops";
+  let description = [{
+    Given a pure operation that is invariant under the pipeline or loop 
+    structure it is contained in, hoists the invariant to the surrounding scope.
+
+    Example:
+    ```mlir
+    scf.for ... {
+      ktdf.pipeline {
+        ktdf.stage {
+          linalg.generic ... {
+          ^bb0(%arg0: i32):
+            %cst0 = arith.constant 0 : i32
+            arith.addi %cst0, %arg0 : i32
+          }
+        }
+      }
+    }
+    ```
+
+    Is transformed into:
+    ```mlir
+    %cst0 = arith.constant 0 : i32
+    scf.for ... {
+      ktdf.pipeline {
+        ktdf.stage {
+          linalg.generic ... {
+          ^bb0(%arg0: i32):
+            arith.addi %cst0, %arg0 : i32
+          }
+        }
+      }
+    }
+    ```
+  }];
+
+  let statistics = [
+    Statistic<"num_hoisted", "num-hoisted", "Number of hoisted operations">,
+  ];
+}
+
+def HoistConstantStoragePass : Pass<"hoist-constant-storage", "mlir::func::FuncOp"> {
+  let summary = "Hoists memory allocations with constant contents";
+  let description = [{
+    Given an allocation that is used to hold a constant value, hoists the 
+    allocation and its write to the surrounding scope. If the write is in a
+    pipeline, it will be hoisted into a sub-pipeline.
+
+    Example:
+    ```mlir
+    scf.for ... {
+      ktdf.pipeline {
+        ktdf.stage {
+          %cst = arith.constant 1.0 : f16
+          %alloc = memref.alloc() : memref<f16, "UNIT">
+          memref.store %cst, %alloc : memref<f16, "UNIT">
+          linalg.generic ...
+            ins(%alloc: memref<f16, "UNIT">)
+            outs(...)
+        } {applicable_units = ["UNIT"]}
+      }
+    }
+    ```
+
+    Is transformed into:
+    ```mlir
+    %cst = arith.constant 1.0 : f16
+    %alloc = memref.alloc() : memref<f16, "UNIT">
+    ktdf.pipeline {
+      ktdf.stage {
+        memref.store %cst, %alloc : memref<f16, "UNIT">
+      } {applicable_units = ["UNIT"]}
+    }
+    scf.for ... {
+      ktdf.pipeline {
+        ktdf.stage {
+          linalg.generic ...
+            ins(%alloc: memref<f16, "UNIT">)
+            outs(...)
+        } {applicable_units = ["UNIT"]}
+      }
+    }
+    ```
+  }];
+
+  let dependentDialects = [
+    "mlir::ktdf::KTDFDialect"
+  ];
+
+  let statistics = [
+    Statistic<"num_hoisted", "num-hoisted", "Number of hoisted constant storage allocations">,
   ];
 }
 

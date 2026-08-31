@@ -21,29 +21,34 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/Support/Alignment.h>
+#include <llvm/Support/CommandLine.h>
+#include <llvm/Support/DebugLog.h>
+#include <llvm/Support/LogicalResult.h>
+#include <mlir/Analysis/Presburger/IntegerRelation.h>
+#include <mlir/Dialect/Affine/IR/AffineOps.h>  // IWYU pragma: keep
+#include <mlir/Dialect/Affine/IR/ValueBoundsOpInterfaceImpl.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/MemRef/IR/MemRef.h>
+#include <mlir/IR/Builders.h>
+#include <mlir/IR/BuiltinTypeInterfaces.h>
+#include <mlir/IR/OpDefinition.h>
+#include <mlir/IR/OperationSupport.h>
+#include <mlir/IR/ValueRange.h>
+#include <mlir/Interfaces/AlignmentAttrInterface.h>
+#include <mlir/Interfaces/SideEffectInterfaces.h>
+#include <mlir/Interfaces/ValueBoundsOpInterface.h>
+#include <mlir/Pass/Pass.h>
+
 #include <memory>
 #include <optional>
 
 #include "dataflow-scheduler/Analysis/MemoryTrackerAnalysis.h"
 #include "dataflow-scheduler/Analysis/Utils.h"
-#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
-#include "dataflow-scheduler/Dialect/KTDF/Utils/Utils.h"
-#include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
+#include "dataflow-scheduler/Dialect/KTDF/KTDFDialect.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
-#include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/CommandLine.h"
-#include "llvm/Support/DebugLog.h"
-#include "mlir/Analysis/Presburger/IntegerRelation.h"
-#include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Affine/IR/ValueBoundsOpInterfaceImpl.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/BuiltinTypes.h"
-#include "mlir/Interfaces/ValueBoundsOpInterface.h"
-#include "mlir/Pass/Pass.h"
 
 #define PASS_NAME "address-assignment"
 #define DEBUG_TYPE PASS_NAME
@@ -60,81 +65,161 @@ namespace scheduler {
 }  // namespace scheduler
 
 namespace {
-/// Compute the upper bound for a dynamic dimension.
-/// Returns -1 if the bound cannot be computed.
-int64_t computeDynamicDimensionBound(mlir::Value dynamic_size, size_t dim_idx) {
-  LDBG(1) << "  Dynamic dim " << dim_idx << ": SSA value " << dynamic_size;
 
-  llvm::FailureOr<int64_t> upper_bound =
-      mlir::ValueBoundsConstraintSet::computeConstantBound(
-          mlir::presburger::BoundType::UB, dynamic_size,
-          /*stopCondition=*/nullptr, /*closedUB=*/true);
+/// Tries to determine the upper bound of @p shape given @p dynamic_sizes .
+[[nodiscard]] auto getUpperBound(llvm::ArrayRef<int64_t> shape,
+                                 mlir::ValueRange dynamic_sizes)
+    -> llvm::FailureOr<llvm::SmallVector<int64_t>> {
+  llvm::SmallVector<int64_t> result;
 
-  if (mlir::succeeded(upper_bound)) {
-    LDBG(1) << "    Computed upper bound: " << *upper_bound;
-    return *upper_bound;
-  }
-
-  LDBG(1) << "    Failed to compute constant upper bound";
-  LDBG(1) << "    Note: ValueBoundsConstraintSet could not resolve the bound "
-             "to a constant value.";
-  LDBG(1) << "    This may require more sophisticated analysis or manual "
-             "annotation.";
-  return -1;
-}
-
-/// Compute total number of size of a memref.alloc in terms of the number of
-/// elements. Returns -1 if any dynamic dimension cannot be resolved.
-int64_t computeTotalElements(mlir::memref::AllocOp alloc) {
-  auto shape = alloc.getType().getShape();
-  int64_t total_elements = 1;
-  unsigned dynamic_dim_idx = 0;
-
-  for (size_t i = 0; i < shape.size(); ++i) {
-    if (shape[i] == mlir::ShapedType::kDynamic) {
-      mlir::Value dynamic_size = alloc.getDynamicSizes()[dynamic_dim_idx++];
-      int64_t bound = computeDynamicDimensionBound(dynamic_size, i);
-      if (bound < 0) {
-        return -1;
-      }
-      total_elements *= bound;
-    } else {
-      total_elements *= shape[i];
+  unsigned dynamic_index = 0U;
+  for (auto [idx, dim] : llvm::enumerate(shape)) {
+    if (mlir::ShapedType::isStatic(dim)) {
+      result.push_back(dim);
+      continue;
     }
+
+    const auto size = dynamic_sizes[dynamic_index++];
+    LDBG(1) << "  Dynamic dim " << idx << ": SSA value " << size;
+
+    const auto maybe_bound =
+        mlir::ValueBoundsConstraintSet::computeConstantBound(
+            mlir::presburger::BoundType::UB, size, nullptr, true);
+    if (llvm::failed(maybe_bound)) {
+      LDBG(1) << "    Failed to compute constant upper bound";
+      LDBG(1)
+          << "    Note: ValueBoundsConstraintSet could not resolve the bound "
+             "to a constant value.";
+      LDBG(1) << "    This may require more sophisticated analysis or manual "
+                 "annotation.";
+      return llvm::failure();
+    }
+
+    LDBG(1) << "    Computed upper bound: " << *maybe_bound;
+    result.push_back(*maybe_bound);
   }
 
-  return total_elements;
+  return std::move(result);
 }
 
-/// Compute the total allocation size in bytes for a memref.alloc operation.
-/// For dynamic dimensions, attempts to compute upper bounds using
-/// ValueBoundsConstraintSet. Returns -1 if any dimension cannot be resolved.
-int64_t computeAllocationSize(mlir::memref::AllocOp alloc) {
-  auto memref_type = alloc.getType();
-
-  LDBG(1) << "Analyzing allocation: " << alloc;
-  LDBG(1) << "  Type: " << memref_type;
-
-  int64_t total_elements = computeTotalElements(alloc);
-  if (total_elements < 0) {
-    return -1;
+/// Named constraint for an allocation that is processed by this pass.
+struct AllocOp
+    : mlir::Op<AllocOp, mlir::OpTrait::ZeroRegions, mlir::OpTrait::OneResult,
+               mlir::OpTrait::OneTypedResult<mlir::MemRefType>::Impl,
+               mlir::MemoryEffectOpInterface::Trait> {
+  [[nodiscard]] static auto classof(mlir::Operation* op) -> bool {
+    return llvm::isa<mlir::memref::AllocOp, mlir::memref::AllocaOp>(op);
   }
 
-  int64_t element_size_bytes = *tryGetSizeInBytes(memref_type.getElementType());
-  int64_t total_bytes = total_elements * element_size_bytes;
+  using Op::Op;
 
-  LDBG(1) << "  Total size: " << total_bytes << " bytes (" << total_elements
-          << " elements * " << element_size_bytes << " bytes/element)";
+  /*implicit*/ AllocOp(mlir::memref::AllocOp alloc) : Op(alloc) {}
+  /*implicit*/ AllocOp(mlir::memref::AllocaOp alloc) : Op(alloc) {}
 
-  return total_bytes;
-}
+  void getEffects(llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                      mlir::MemoryEffects::Effect>>& effects) {
+    llvm::cast<mlir::MemoryEffectOpInterface>(getOperation())
+        .getEffects(effects);
+  }
+
+  /// Tries to get the dynamic sizes associated with this allocation, if any.
+  [[nodiscard]] auto getDynamicSizes() -> llvm::FailureOr<mlir::OperandRange> {
+    if (auto alloc = llvm::dyn_cast<mlir::memref::AllocOp>(getOperation())) {
+      return alloc.getDynamicSizes();
+    }
+    if (auto alloc = llvm::dyn_cast<mlir::memref::AllocaOp>(getOperation())) {
+      return alloc.getDynamicSizes();
+    }
+    return llvm::failure();
+  }
+
+  /// Tries to get the static upper bound for the allocated memref shape.
+  [[nodiscard]] auto getUpperShapeBound()
+      -> llvm::FailureOr<llvm::SmallVector<int64_t>> {
+    if (getType().hasStaticShape()) {
+      return llvm::to_vector(getType().getShape());
+    }
+
+    const auto maybe_sizes = getDynamicSizes();
+    if (llvm::failed(maybe_sizes)) {
+      return llvm::failure();
+    }
+    return getUpperBound(getType().getShape(), *maybe_sizes);
+  }
+
+  /// Tries to get the static upper bound for the largest element offset.
+  [[nodiscard]] auto getUpperOffsetBound() -> llvm::FailureOr<size_t> {
+    auto maybe_shape = getUpperShapeBound();
+    if (llvm::failed(maybe_shape)) {
+      return llvm::failure();
+    }
+
+    llvm::SmallVector<int64_t> strides;
+    int64_t offset;
+    if (llvm::failed(getType().getLayout().getStridesAndOffset(
+            *maybe_shape, strides, offset)) ||
+        offset < 0 ||
+        llvm::any_of(strides, [](int64_t stride) { return stride < 0; })) {
+      LDBG() << "unsupported layout: " << getType().getLayout();
+      return llvm::failure();
+    }
+
+    auto result = static_cast<size_t>(offset);
+    for (auto [sz, stride] : llvm::zip_equal(*maybe_shape, strides)) {
+      size_t temp;
+      if (__builtin_mul_overflow(sz - 1, stride, &temp) ||
+          __builtin_add_overflow(result, temp, &result)) {
+        LDBG() << "allocation too large";
+        return llvm::failure();
+      }
+    }
+    return result;
+  }
+
+  /// Tries to get the static lower bound for the allocation size.
+  [[nodiscard]] auto getSize() -> llvm::FailureOr<size_t> {
+    LDBG(1) << "Analyzing allocation: " << *this;
+    LDBG(1) << "  Type: " << getResult().getType();
+
+    const auto maybe_offset = getUpperOffsetBound();
+    if (llvm::failed(maybe_offset)) {
+      return llvm::failure();
+    }
+    const auto maybe_size =
+        tryGetSizeInBytes(getResult().getType().getElementType());
+    if (!maybe_size) {
+      LDBG() << "unsupported element type";
+      return llvm::failure();
+    }
+
+    size_t total_bytes;
+    if (__builtin_mul_overflow(*maybe_offset + 1, *maybe_size, &total_bytes)) {
+      LDBG() << "allocation too large";
+      return llvm::failure();
+    }
+
+    LDBG(1) << "  Total size: " << total_bytes << " bytes (" << *maybe_offset
+            << " elements * " << *maybe_size << " bytes/element)";
+    return total_bytes;
+  }
+
+  /// Gets the alignment requirement, if any.
+  [[nodiscard]] auto getAlignment() -> llvm::MaybeAlign {
+    if (auto iface =
+            llvm::dyn_cast<mlir::AlignmentAttrOpInterface>(getOperation());
+        iface) {
+      return iface.getMaybeAlign();
+    }
+    return {};
+  }
+};
 
 /// Collect all memref.alloc operations that have a memory space attribute.
-llvm::SmallVector<mlir::memref::AllocOp> collectAllocations(
-    mlir::ModuleOp module) {
-  llvm::SmallVector<mlir::memref::AllocOp> allocs;
+[[nodiscard]] auto collectAllocations(mlir::ModuleOp module)
+    -> llvm::SmallVector<AllocOp> {
+  llvm::SmallVector<AllocOp> allocs;
 
-  module.walk([&](mlir::memref::AllocOp alloc) {
+  module.walk([&](AllocOp alloc) {
     auto memref_type = alloc.getType();
     if (memref_type.getMemorySpace()) {
       allocs.push_back(alloc);
@@ -147,24 +232,16 @@ llvm::SmallVector<mlir::memref::AllocOp> collectAllocations(
   return allocs;
 }
 
-/// Log allocation statistics.
-void logAllocationStats(
-    const llvm::SmallVector<mlir::memref::AllocOp>& allocs) {
-  LDBG(1) << "Found " << allocs.size()
-          << " allocations with memory space attributes";
-}
-
 /// Result of processing a single allocation.
 struct AllocationResult {
   bool success;
   size_t assigned_address;
-  int64_t size;
+  size_t size;
 };
 
 /// Replace memref.alloc with unrealized_conversion_cast using the assigned
 /// address, and remove any corresponding memref.dealloc operations.
-void materializeAddressAssignment(mlir::memref::AllocOp alloc,
-                                  size_t assigned_address,
+void materializeAddressAssignment(AllocOp alloc, size_t assigned_address,
                                   mlir::OpBuilder& builder) {
   builder.setInsertionPoint(alloc);
 
@@ -203,84 +280,6 @@ void materializeAddressAssignment(mlir::memref::AllocOp alloc,
   alloc.erase();
 }
 
-/// Process a single allocation and assign an address.
-std::optional<AllocationResult> processAllocation(
-    mlir::memref::AllocOp alloc, MemoryTrackerAnalysis& tracker,
-    mlir::OpBuilder& builder) {
-  int64_t size = computeAllocationSize(alloc);
-  if (size < 0) {
-    LDBG(1) << "  Skipping allocation with unknown size: " << alloc;
-    return std::nullopt;
-  }
-
-  // Get the memory space attribute from the memref type
-  auto memref_type = alloc.getType();
-  mlir::Attribute memory_space_attr = memref_type.getMemorySpace();
-  assert(memory_space_attr);
-
-  const size_t alignment = alloc.getAlignment().value_or(1);
-  auto address_result =
-      tracker.allocate(memory_space_attr, static_cast<size_t>(size), alignment);
-
-  if (!address_result) {
-    llvm::Error err = address_result.takeError();
-    std::string error_msg;
-    llvm::handleAllErrors(std::move(err), [&](const llvm::ErrorInfoBase& ei) {
-      error_msg = ei.message();
-    });
-
-    alloc.emitError() << "Failed to allocate " << memory_space_attr
-                      << " memory: " << error_msg;
-    return std::nullopt;
-  }
-
-  size_t assigned_address = *address_result;
-
-  LDBG(1) << "  Assigned address " << assigned_address
-          << " to allocation: " << alloc;
-  LDBG(1) << "    Size: " << size << " bytes, Alignment: " << alignment
-          << " bytes";
-
-  // Materialize the address assignment in the IR
-  materializeAddressAssignment(alloc, assigned_address, builder);
-
-  return AllocationResult{true, assigned_address, size};
-}
-
-/// Process all allocations and assign addresses.
-/// Returns the number of successful and failed assignments.
-std::pair<int, int> processAllocations(
-    const llvm::SmallVector<mlir::memref::AllocOp>& allocs,
-    MemoryTrackerAnalysis& tracker, mlir::MLIRContext* context) {
-  if (allocs.empty()) {
-    return {0, 0};
-  }
-
-  LDBG(1) << "Processing allocations with MemoryTracker:";
-
-  mlir::OpBuilder builder(context);
-  int successful_assignments = 0;
-  int failed_assignments = 0;
-
-  for (auto alloc : allocs) {
-    auto result = processAllocation(alloc, tracker, builder);
-    if (result) {
-      successful_assignments++;
-    } else {
-      failed_assignments++;
-    }
-  }
-
-  LDBG(1) << "Allocation summary:";
-  LDBG(1) << "  Total allocations: " << allocs.size();
-  LDBG(1) << "  Successfully assigned: " << successful_assignments;
-  LDBG(1) << "  Failed assignments: " << failed_assignments;
-  // TODO: Use memory hierarchy view to diagnose memref.alloc in namespaces
-  // that are not supposed to be address assigned by the scheduler
-
-  return {successful_assignments, failed_assignments};
-}
-
 struct AddressAssignmentPass
     : public impl::AddressAssignmentPassBase<AddressAssignmentPass> {
   AddressAssignmentPass()
@@ -289,7 +288,10 @@ struct AddressAssignmentPass
       : scheduler_ctx_(ctx) {}
 
   void runOnOperation() override {
-    if (DisableThisPass) return;
+    if (DisableThisPass) {
+      return;
+    }
+
     LDBG(1) << "========= " PASS_NAME " =========";
 
     mlir::ModuleOp module = getOperation();
@@ -298,24 +300,82 @@ struct AddressAssignmentPass
 
     // Collect all allocations with memory space attributes
     auto allocs = collectAllocations(module);
-    logAllocationStats(allocs);
+    LDBG(1) << "Found " << allocs.size()
+            << " allocations with memory space attributes";
+    if (allocs.empty()) {
+      return;
+    }
 
-    // Get the MemoryTrackerAnalysis (automatically initialized from
-    // DeviceManager)
+    // Get the MemoryTrackerAnalysis.
     auto& tracker = getAnalysis<MemoryTrackerAnalysis>();
+    mlir::OpBuilder builder(&getContext());
 
-    // Process all allocations
-    auto [successful, failed] =
-        processAllocations(allocs, tracker, &getContext());
+    LDBG(1) << "Processing allocations with MemoryTracker:";
 
-    if (failed > 0) {
+    for (auto alloc : allocs) {
+      if (failed(processAllocation(alloc, tracker, builder))) {
+        ++num_failed;
+      }
+      ++num_processed;
+    }
+
+    LDBG(1) << "Allocation summary:";
+    LDBG(1) << "  Total allocations: " << num_processed;
+    LDBG(1) << "  Failed assignments: " << num_failed;
+    // TODO: Use memory hierarchy view to diagnose memref.alloc in namespaces
+    // that are not supposed to be address assigned by the scheduler
+
+    if (num_failed > 0) {
       module->emitError("AddressAssignment: failed to assign addresses for ")
-          << failed << " allocation(s)";
+          << num_failed << " allocation(s)";
       signalPassFailure();
     }
   }
 
  private:
+  auto processAllocation(AllocOp alloc, MemoryTrackerAnalysis& tracker,
+                         mlir::OpBuilder& builder)
+      -> llvm::FailureOr<AllocationResult> {
+    const auto maybe_size = alloc.getSize();
+    if (llvm::failed(maybe_size)) {
+      LDBG(1) << "  Skipping allocation with unknown size: " << alloc;
+      return llvm::failure();
+    }
+
+    // Get the memory space attribute from the memref type
+    auto memref_type = alloc.getType();
+    mlir::Attribute memory_space_attr = memref_type.getMemorySpace();
+    assert(memory_space_attr);
+
+    const auto alignment = alloc.getAlignment().valueOrOne();
+    auto address_result =
+        tracker.allocate(memory_space_attr, *maybe_size, alignment.value());
+
+    if (!address_result) {
+      llvm::Error err = address_result.takeError();
+      std::string error_msg;
+      llvm::handleAllErrors(std::move(err), [&](const llvm::ErrorInfoBase& ei) {
+        error_msg = ei.message();
+      });
+
+      alloc.emitError() << "Failed to allocate " << memory_space_attr
+                        << " memory: " << error_msg;
+      return llvm::failure();
+    }
+
+    size_t assigned_address = *address_result;
+
+    LDBG(1) << "  Assigned address " << assigned_address
+            << " to allocation: " << alloc;
+    LDBG(1) << "    Size: " << *maybe_size
+            << " bytes, Alignment: " << alignment.value() << " bytes";
+
+    // Materialize the address assignment in the IR
+    materializeAddressAssignment(alloc, assigned_address, builder);
+
+    return AllocationResult{true, assigned_address, *maybe_size};
+  }
+
   const SchedulerExtContext& scheduler_ctx_;
 };
 

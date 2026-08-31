@@ -6,9 +6,12 @@ add_dataflow_scheduler_library(DataflowSchedulerTransforms
     PathExpansion/PlannerFactories.cpp
     AddressAssignment.cpp
     AffineMinCanonicalization.cpp
+    ApplyDevicePatterns.cpp
     DoubleBuffering.cpp
     EnsureDeviceDeclaration.cpp
-    HoistRegisters.cpp
+    HoistConstantStorage.cpp
+    HoistInvariants.cpp
+    MaterializeRegisters.cpp
     NormalizeGridTo1D.cpp
     NormalizeSCFForLoops.cpp
     ParallelizeLoopsAcrossInstances.cpp
@@ -33,6 +36,7 @@ add_dataflow_scheduler_library(DataflowSchedulerTransforms
     DataflowScheduler::KTDFAnalysis
     DataflowSchedulerDialects::KTDFDialect
     DataflowSchedulerDialects::KTDFArchAnalysis
+    DataflowSchedulerDialects::KTDFArchTransforms
     DataflowScheduler::KTDFTransforms
     DataflowScheduler::KTDFUtils
     DataflowScheduler::TransformUtils
@@ -44,4 +48,6 @@ add_dataflow_scheduler_library(DataflowSchedulerTransforms
     MLIRMathDialect
     MLIRPass
     MLIRTransformUtils
+    MLIRValueBoundsOpInterface
+    MLIRAlignmentAttrInterface
 )
