@@ -66,6 +66,10 @@ std::unique_ptr<mlir::Pass> createEnsureDeviceDeclarationPass();
 std::unique_ptr<mlir::Pass> createEnsureDeviceDeclarationPass(
     EnsureDeviceDeclarationPassOptions options);
 
+[[nodiscard]]
+std::unique_ptr<mlir::Pass> createApplyDevicePatternsPass(
+    std::initializer_list<llvm::StringRef> enabled_groups);
+
 }  // namespace scheduler
 
 #endif  // DATAFLOW_SCHEDULER_TRANSFORM_PASSES_H

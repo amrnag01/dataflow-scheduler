@@ -30,7 +30,6 @@
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/Passes.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
-#include "dataflow-scheduler/Dialect/KTDFArch/Transforms/ApplyPatterns.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Transforms/Passes.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
@@ -45,7 +44,7 @@ void scheduler::buildKTIRFrontendPipeline(
   //  -> Apply patterns that subtitute front-end constructs that might make
   //     scheduler-illegal programs legal.
   // pm.addNestedPass<mlir::func::FuncOp>(
-  //     mlir::ktdf_arch::createApplyPatternsPass({"pre_mapping"}));
+  //     createApplyDevicePatternsPass({"pre_mapping"}));
 
   pm.addPass(createKTIRLegalityCheckPass());
   pm.addPass(createComputeGroupExtractionPass());
@@ -61,13 +60,19 @@ void scheduler::buildSchedulerOptimizationPipeline(
   //     constraints in the IR.
   //  -> Apply patterns that introduce or rewrite mapping constraints or
   //     interact with 'ktdf'.
-  pm.nest<mlir::ModuleOp>().addNestedPass<mlir::func::FuncOp>(
-      mlir::ktdf_arch::createApplyPatternsPass({"pre_scheduling"}));
-
+  {
+    auto& nested = pm.nest<mlir::ModuleOp>().nest<mlir::func::FuncOp>();
+    nested.addPass(createApplyDevicePatternsPass({"pre_scheduling"}));
+    nested.addPass(createHoistInvariantsPass());
+  }
   // The patterns above rewrite inside a generic's body and can only insert
   // where they matched, so the registers they need land there.
-  pm.addPass(createHoistRegistersPass());
-
+  pm.addPass(createMaterializeRegistersPass());
+  {
+    auto& nested = pm.nest<mlir::ModuleOp>().nest<mlir::func::FuncOp>();
+    nested.addPass(createHoistInvariantsPass());
+    nested.addPass(createHoistConstantStoragePass());
+  }
   pm.addPass(createPathExpansionPass(scheduler_ctx));
   pm.addPass(createScalarBroadcastLegalizationPass());
   pm.addPass(createNormalizeSCFForLoopsPass());
@@ -100,7 +105,7 @@ void scheduler::buildSchedulerOptimizationPipeline(
   //     and materialized concrete trip counts.
   //  -> Apply patterns that add/remove allocations or coalesce FIFOs.
   // pm.nest<mlir::ModuleOp>().addNestedPass<mlir::func::FuncOp>(
-  //     mlir::ktdf_arch::createApplyPatternsPass({"post_scheduling"}));
+  //     createApplyDevicePatternsPass({"post_scheduling"}));
 
   pm.addPass(createAddressAssignmentPass(scheduler_ctx));
   // TODO: position of cross-instance parallelization is TBD
@@ -118,7 +123,7 @@ void scheduler::buildDFIRBackendPipeline(
   //   - The scheduler is down to using memory buffers, but still uses SSA.
   //  -> Apply patterns that produce custom DFIR.
   pm.nest<mlir::ModuleOp>().addNestedPass<mlir::func::FuncOp>(
-      mlir::ktdf_arch::createApplyPatternsPass({"post_lowering"}));
+      createApplyDevicePatternsPass({"post_lowering"}));
 
   pm.addPass(createKTDFLowToDFIRPass());
   // And each program given the two levels it is read at: what it is, and the
