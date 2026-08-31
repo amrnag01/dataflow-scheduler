@@ -135,10 +135,15 @@ bool AgenticTileSizeSelector::generateSymbolicCostModel(
   symbolic_cost_function_ = original_function;
 
   // Determine number of tile sizes from function signature
+  // Extract only s0, s1, ... parameters, excluding use_locals
   std::regex sig_regex(R"(def\s+latency_function\s*\(\s*([^)]+)\s*\))");
   std::smatch match;
   if (std::regex_search(original_function, match, sig_regex)) {
     std::string params = match[1];
+    // Remove "use_locals=False" or similar keyword arguments
+    std::regex kwarg_regex(",?\\s*use_locals\\s*=[^,)]*");
+    params = std::regex_replace(params, kwarg_regex, "");
+    // Count commas and add 1 to get tile size count
     num_tile_sizes_ = std::count(params.begin(), params.end(), ',') + 1;
   } else {
     llvm::errs() << "Could not parse latency_function signature\n";
@@ -188,7 +193,7 @@ AgenticTileSizeSelector::evaluateSymbolicCostFunction(
   }
 
   std::ofstream py_file(temp_py.c_str());
-  py_file << "import sys\n";
+  py_file << "import sys\nimport json\n";
   py_file << "sys.path.insert(0, '" << cost_model_path_ << "/latency_model')\n";
   py_file << "from model import latency_function\n";
   py_file << "result = latency_function(";
@@ -196,8 +201,17 @@ AgenticTileSizeSelector::evaluateSymbolicCostFunction(
     if (i > 0) py_file << ", ";
     py_file << tile_sizes[i];
   }
-  py_file << ")\n";
-  py_file << "print(f'{result:.15e}')\n";
+  py_file << ", use_locals=True)\n";
+  py_file << "latency, all_locals = result\n";
+  py_file << "# Extract only numeric intermediate variables (x0, x1, ... and "
+             "p_0)\n";
+  py_file << "vars_dict = {}\n";
+  py_file << "for name, value in all_locals.items():\n";
+  py_file << "    if isinstance(value, (int, float)) and (name.startswith('x') "
+             "or name == 'p_0'):\n";
+  py_file << "        vars_dict[name] = float(value)\n";
+  py_file << "output = {'latency': float(latency), 'variables': vars_dict}\n";
+  py_file << "print(json.dumps(output))\n";
   py_file.close();
 
   // Execute the Python script
@@ -235,16 +249,28 @@ AgenticTileSizeSelector::evaluateSymbolicCostFunction(
         false, 0.0, {}, "Cost function evaluation failed: " + output_content};
   }
 
-  // Parse latency value from output
+  // Parse JSON output to extract latency and variables
+  std::map<std::string, double> variables;
   double latency = 0.0;
-  char* end_ptr = nullptr;
-  latency = std::strtod(output_content.c_str(), &end_ptr);
-  if (end_ptr == output_content.c_str() || latency == 0.0) {
-    return {false, 0.0, {}, "Failed to parse latency value: " + output_content};
+
+  // Validate JSON format first
+  if (!json::accept(output_content)) {
+    return {false, 0.0, {}, "Failed to parse JSON output: " + output_content};
   }
 
-  // For now, return empty variables map (can be enhanced later)
-  std::map<std::string, double> variables;
+  json result_json = json::parse(output_content);
+  if (result_json.contains("latency")) {
+    latency = result_json["latency"].get<double>();
+  }
+  if (result_json.contains("variables") &&
+      result_json["variables"].is_object()) {
+    for (auto& [key, val] : result_json["variables"].items()) {
+      if (val.is_number()) {
+        variables[key] = val.get<double>();
+      }
+    }
+  }
+
   return {true, latency, variables, ""};
 }
 
@@ -292,10 +318,13 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
       "far.\n\n"
       "IMPORTANT: (1) Your reasoning must be grounded ONLY in mathematical "
       "analysis of "
-      "the cost function. (2) You are allowed to call the evaluate_cost tool "
+      "the cost function AND intermediate variable values returned to you. As "
+      "part of the reasoning, look at the dominant intermediate values "
+      "returned to you, and see how they changed from your best solution. (2) "
+      "You are allowed to call the evaluate_cost tool "
       "only "
       "if you believe that your newly selected tile sizes for evaluation will "
-      "be better than the best solution you have found so far";
+      "be better than the best solution you have found so far \n\n";
   messages.push_back(user_msg);
 
   // Tool-use loop
@@ -424,26 +453,14 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
               llvm::errs() << (i > 0 ? ", " : "") << tile_sizes[i];
             }
             llvm::errs() << "\n";
+            llvm::errs() << "Reasoning: " << reasoning << "\n";
 
             auto eval_result = evaluateSymbolicCostFunction(tile_sizes);
 
-            llvm::errs() << "Reasoning: " << reasoning << "\n";
             if (eval_result.success) {
               std::ostringstream latency_str;
               latency_str << std::setprecision(15) << eval_result.latency;
               llvm::errs() << "Latency: " << latency_str.str() << " sec\n";
-
-              // Log intermediate variables
-              if (!eval_result.variables.empty()) {
-                llvm::errs() << "Intermediate variables:\n";
-                for (const auto& [var_name, var_value] :
-                     eval_result.variables) {
-                  std::ostringstream var_oss;
-                  var_oss << std::setprecision(10) << var_value;
-                  llvm::errs()
-                      << "  " << var_name << " = " << var_oss.str() << "\n";
-                }
-              }
             } else {
               llvm::errs() << "Error: " << eval_result.error_message << "\n";
             }
@@ -468,7 +485,21 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
             if (eval_result.success) {
               std::ostringstream oss;
               oss << std::setprecision(15) << eval_result.latency;
-              tool_result["content"] = "Latency: " + oss.str() + " sec";
+
+              std::string result_str = "Latency: " + oss.str() + " sec\n";
+
+              // Include intermediate variables to help identify dominant terms
+              if (!eval_result.variables.empty()) {
+                result_str += "\nIntermediate variables:\n";
+                for (const auto& [var_name, var_value] :
+                     eval_result.variables) {
+                  std::ostringstream var_oss;
+                  var_oss << std::setprecision(10) << var_value;
+                  result_str += var_name + " = " + var_oss.str() + "\n";
+                }
+              }
+
+              tool_result["content"] = result_str;
             } else {
               tool_result["content"] = "Error: " + eval_result.error_message;
               tool_result["is_error"] = true;
@@ -522,7 +553,14 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(
   ss << "Use the 'evaluate_cost' tool to test tile size assignments:\n";
   ss << "1. Takes an array of tile-size values (s0, s1, ...)\n";
   ss << "2. Evaluates the symbolic cost function with those concrete values\n";
-  ss << "3. Returns the final latency in seconds\n\n";
+  ss << "3. Returns the final latency in seconds AND all intermediate "
+        "variables. These intermediate values are critical in helping find "
+        "better solutions, so make sure you use them!\n";
+  ss << "4. Use the intermediate variable values to identify which terms "
+        "dominate "
+        "the latency (critical path)\n";
+  ss << "5. Trace back through the formulas to understand how each tile size "
+        "affects the largest terms\n\n";
 
   ss << "Tiling Decision Points:\n";
   for (size_t i = 0; i < analyses.size(); ++i) {
