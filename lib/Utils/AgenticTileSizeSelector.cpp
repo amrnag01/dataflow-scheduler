@@ -286,20 +286,16 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
   user_msg["role"] = "user";
   user_msg["content"] =
       "Optimize this symbolic cost function by PURE MATHEMATICAL ANALYSIS.\n\n"
-      "Do NOT try random tile sizes. Every call to evaluate_cost must be because "
-      "you mathematically predict it will improve on the best result so far.\n\n"
-      "Process:\n"
-      "1. Deeply analyze the cost formula - which terms dominate?\n"
-      "2. Trace each tile size parameter through the formula - how does it "
-      "scale each dominant term?\n"
-      "3. Identify the mathematical minimum based on how the formula scales\n"
-      "4. PREDICT the optimal tile sizes purely from formula analysis\n"
-      "5. If you want to test a value with evaluate_cost, state clearly why "
-      "your mathematical analysis says it should be better\n"
-      "6. After each result, refine your understanding of the formula\n"
-      "7. Call submit_final_answer only when mathematically certain you have "
-      "the optimum\n\n"
-      "Reason mathematically. Only evaluate costs you predict will improve.";
+      "Do NOT try random tile sizes. Every call to evaluate_cost must be "
+      "because "
+      "you mathematically predict it will improve on the best result so "
+      "far.\n\n"
+      "IMPORTANT: (1) Your reasoning must be grounded ONLY in mathematical "
+      "analysis of "
+      "the cost function. (2) You are allowed to call the evaluate_cost tool "
+      "only "
+      "if you believe that your newly selected tile sizes for evaluation will "
+      "be better than the best solution you have found so far";
   messages.push_back(user_msg);
 
   // Tool-use loop
@@ -510,24 +506,17 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(
   ss << symbolic_cost_function_ << "\n\n";
 
   ss << "=== MATHEMATICAL ANALYSIS STRATEGY ===\n";
-  ss << "CRITICAL: Only call evaluate_cost if you have a mathematical reason to "
-        "believe it will improve latency.\n";
-  ss << "For EVERY evaluate_cost call and final answer, provide mathematical "
-        "reasoning:\n";
-  ss << "1. Analyze the cost expression algebraically - identify which terms "
-        "dominate (critical path)\n";
-  ss << "2. For each tile size (s0, s1, ...), trace how it appears in the "
-        "formula - is it linear, quadratic, divisor, etc.?\n";
-  ss << "3. Predict mathematically: how will increasing/decreasing each parameter "
-        "affect the dominant terms?\n";
-  ss << "4. BEFORE calling evaluate_cost: State your hypothesis about which "
-        "assignment should be better and why (based on formula analysis)\n";
-  ss << "5. Only call evaluate_cost if you predict it will beat the current best "
-        "based on your term analysis\n";
-  ss << "6. After seeing results, if prediction was wrong, explain why your "
-        "mathematical analysis was incorrect\n";
-  ss << "7. When submitting final answer, prove mathematically why this minimizes "
-        "the dominant terms\n\n";
+  ss << "CRITICAL: Only call evaluate_cost if you predict it will beat the "
+        "current "
+        "best result"
+        "based on your analysis.\n";
+  ss << "BEFORE calling evaluate_cost: State your hypothesis about why you "
+        "believe the "
+        "assignment should be better than your current best solution (based "
+        "only on formula analysis)\n";
+  ss << "After seeing results, if prediction was wrong, explain why your "
+        "mathematical analysis was incorrect, and learn from your mistakes to "
+        "improve future iterations.\n";
 
   ss << "=== EVALUATION TOOL ===\n";
   ss << "Use the 'evaluate_cost' tool to test tile size assignments:\n";
