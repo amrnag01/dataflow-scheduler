@@ -455,7 +455,15 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
             llvm::errs() << "\n";
             llvm::errs() << "Reasoning: " << reasoning << "\n";
 
-            auto eval_result = evaluateSymbolicCostFunction(tile_sizes);
+            // Validate tile sizes before evaluating cost
+            std::string validation_error;
+            CostEvaluation eval_result;
+            if (!validateTileSizes(analyses, tile_sizes, validation_error)) {
+              llvm::errs() << "Validation Error: " << validation_error << "\n";
+              eval_result = {false, 0.0, {}, "Validation failed: " + validation_error};
+            } else {
+              eval_result = evaluateSymbolicCostFunction(tile_sizes);
+            }
 
             if (eval_result.success) {
               std::ostringstream latency_str;
@@ -939,6 +947,64 @@ void AgenticTileSizeSelector::computeLoopGranularities(
       loop_granularities_[loop] = granularity;
     }
   }
+}
+
+bool AgenticTileSizeSelector::validateTileSizes(
+    llvm::ArrayRef<TileSizeInfo> analyses,
+    const std::vector<int64_t>& tile_sizes,
+    std::string& error_message) {
+  // Check that we have the right number of tile sizes
+  if (tile_sizes.size() != analyses.size()) {
+    error_message = "Expected " + std::to_string(analyses.size()) +
+                    " tile sizes but got " + std::to_string(tile_sizes.size());
+    return false;
+  }
+
+  // Validate each tile size
+  for (size_t i = 0; i < analyses.size(); ++i) {
+    auto& analysis = const_cast<TileSizeInfo&>(analyses[i]);
+    int64_t tile_size = tile_sizes[i];
+
+    // 1. Check minimum value constraint
+    int64_t min_value = analysis.reserve_size_op.getMinValue().getSExtValue();
+    if (tile_size < min_value) {
+      error_message = "Tile size s" + std::to_string(i) + " is " +
+                      std::to_string(tile_size) + " but minimum is " +
+                      std::to_string(min_value);
+      return false;
+    }
+
+    // 2. Check divisibility constraint
+    int64_t divisibility =
+        analysis.reserve_size_op.getDivisibility().getSExtValue();
+    if (tile_size % divisibility != 0) {
+      error_message = "Tile size s" + std::to_string(i) + " is " +
+                      std::to_string(tile_size) +
+                      " but must be divisible by " +
+                      std::to_string(divisibility);
+      return false;
+    }
+
+    // 3. Check granularity constraint from parallel regions
+    int64_t granularity = 1;
+    for (const auto& loop_info : analysis.associated_loops) {
+      auto it = loop_granularities_.find(loop_info.loop);
+      if (it != loop_granularities_.end()) {
+        granularity = it->second;
+        break;
+      }
+    }
+    if (granularity > 1 && tile_size % granularity != 0) {
+      error_message = "Tile size s" + std::to_string(i) + " is " +
+                      std::to_string(tile_size) +
+                      " but must be divisible by " +
+                      std::to_string(granularity) +
+                      " (LCM of parallel region num_instances)";
+      return false;
+    }
+  }
+
+  return true;
 }
 
 bool AgenticTileSizeSelector::validateTileSizeGranularities(

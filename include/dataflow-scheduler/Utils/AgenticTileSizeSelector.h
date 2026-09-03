@@ -70,7 +70,13 @@ class AgenticTileSizeSelector {
   // Compute granularities for all loops once
   void computeLoopGranularities(llvm::ArrayRef<TileSizeInfo> analyses);
 
-  // Validate tile sizes against granularity constraints
+  // Validate tile sizes against all constraints (min_value, divisibility, granularity)
+  bool validateTileSizes(
+      llvm::ArrayRef<TileSizeInfo> analyses,
+      const std::vector<int64_t>& tile_sizes,
+      std::string& error_message);
+
+  // Validate tile sizes against granularity constraints only
   bool validateTileSizeGranularities(
       llvm::ArrayRef<TileSizeInfo> analyses,
       const std::vector<std::pair<int64_t, int64_t>>& tile_size_assignments,
