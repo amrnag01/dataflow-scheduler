@@ -309,10 +309,8 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(
         "loop total_sizes\n";
   ss << "   (i.e., for each associated loop, verify: total_size % candidate == "
         "0)\n";
-  ss << "5. Return the HIGHEST (first) valid candidate that satisfies all "
+  ss << "5. Return the smallest valid candidate that satisfies all "
         "constraints\n";
-  ss << "This heuristic prioritizes larger tile sizes (fewer iterations) "
-        "within constraints.\n";
   ss << "YOUR FIRST CALL should evaluate the heuristic-selected tile sizes to "
         "establish baseline latency.\n\n";
 
@@ -424,9 +422,8 @@ AgenticTileSizeSelector::handleTransformAndEvaluateCost(
   // Apply tile sizes to the cloned module using applyTileSize helper
   // First, create cloned TileSizeInfo structs that point to cloned ops
   std::vector<mlir::ktdf::TilingReserveSizeOp> cloned_ops;
-  cloned_module.walk([&](mlir::ktdf::TilingReserveSizeOp op) {
-    cloned_ops.push_back(op);
-  });
+  cloned_module.walk(
+      [&](mlir::ktdf::TilingReserveSizeOp op) { cloned_ops.push_back(op); });
 
   std::vector<TileSizeInfo> cloned_analyses;
   cloned_analyses.reserve(analyses.size());
