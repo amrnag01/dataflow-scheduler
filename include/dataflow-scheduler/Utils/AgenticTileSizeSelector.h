@@ -42,6 +42,7 @@ class AgenticTileSizeSelector {
       const std::string& api_key,
       const std::string& ktdf_bindings_dir,
       const std::string& cost_model_path,
+      const std::string& learnings_file_path,
       bool debug = false);
   ~AgenticTileSizeSelector();
 
@@ -55,6 +56,8 @@ class AgenticTileSizeSelector {
   std::string api_key_;
   std::string ktdf_bindings_dir_;
   std::string cost_model_path_;
+  std::string learnings_file_path_;
+  std::string learnings_content_;
   bool debug_;
 
   // Maps each loop to the LCM of num_instances of parallel regions in its body
@@ -96,6 +99,9 @@ class AgenticTileSizeSelector {
       const std::string& ir_str,
       const std::vector<std::pair<int64_t, int64_t>>& tile_size_assignments,
       bool success);
+
+  // Validate and append learnings to learnings file
+  void appendLearningstToFile(const std::vector<std::string>& learnings);
 
   // HTTP communication with Claude
   std::string makeHttpRequestWithTools(

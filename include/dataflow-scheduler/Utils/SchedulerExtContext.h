@@ -82,6 +82,7 @@ struct AgentDrivenSchedulerContext : SchedulerExtContext {
   std::unique_ptr<AnthropicAgentClient> agent_client;
   std::string ktdf_bindings_dir;
   std::string cost_model_path;
+  std::string learnings_file_path;
   std::string api_key;
   bool debug;
 
@@ -89,6 +90,7 @@ struct AgentDrivenSchedulerContext : SchedulerExtContext {
       const std::string& api_key,
       const std::string& ktdf_bindings_dir,
       const std::string& cost_model_path,
+      const std::string& learnings_file_path,
       bool debug = false);
   ~AgentDrivenSchedulerContext();
 

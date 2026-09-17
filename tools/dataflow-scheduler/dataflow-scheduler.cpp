@@ -59,6 +59,11 @@ static llvm::cl::opt<std::string> costModelPath(
     llvm::cl::desc("Path to samm-ktdf cost model directory"),
     llvm::cl::init(""));
 
+static llvm::cl::opt<std::string> learningsFilePath(
+    "learnings_file",
+    llvm::cl::desc("Path to learnings.md file for tile size guidance"),
+    llvm::cl::init(""));
+
 static llvm::cl::opt<bool> agentDebug(
     "agent-debug",
     llvm::cl::desc("Enable debug mode for agent: dump all IRs passed to cost model"),
@@ -78,15 +83,17 @@ void registerPassPipelinesForScheduler() {
         }
 
         if (!api_key.empty()) {
-          // API key provided — require cost model paths
-          if (ktdfBindingsDir.empty() || costModelPath.empty()) {
+          // API key provided — require cost model paths and learnings file
+          if (ktdfBindingsDir.empty() || costModelPath.empty() ||
+              learningsFilePath.empty()) {
             llvm::report_fatal_error(
-                "When using agent-driven tile size selection, both "
-                "-ktdf_bindings_dir and -cost_model_path must be provided");
+                "When using agent-driven tile size selection, all of "
+                "-ktdf_bindings_dir, -cost_model_path, and -learnings_file must be provided");
           }
           g_scheduler_context =
               std::make_unique<scheduler::AgentDrivenSchedulerContext>(
-                  api_key, ktdfBindingsDir, costModelPath, agentDebug);
+                  api_key, ktdfBindingsDir, costModelPath, learningsFilePath,
+                  agentDebug);
         } else {
           g_scheduler_context =
               std::make_unique<scheduler::DummySchedulerExtContext>();

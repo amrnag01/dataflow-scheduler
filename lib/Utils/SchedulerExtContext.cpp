@@ -44,10 +44,12 @@ AgentDrivenSchedulerContext::AgentDrivenSchedulerContext(
     const std::string& api_key,
     const std::string& ktdf_bindings_dir,
     const std::string& cost_model_path,
+    const std::string& learnings_file_path,
     bool debug)
     : agent_client(std::make_unique<AnthropicAgentClient>(api_key)),
       ktdf_bindings_dir(ktdf_bindings_dir),
       cost_model_path(cost_model_path),
+      learnings_file_path(learnings_file_path),
       api_key(api_key),
       debug(debug) {}
 
@@ -61,6 +63,7 @@ int64_t AgentDrivenSchedulerContext::selectTileSize(
 std::vector<int64_t> AgentDrivenSchedulerContext::selectAllTileSizes(
     mlir::ModuleOp module,
     llvm::ArrayRef<TileSizeInfo> analyses) {
-  AgenticTileSizeSelector selector(api_key, ktdf_bindings_dir, cost_model_path, debug);
+  AgenticTileSizeSelector selector(api_key, ktdf_bindings_dir, cost_model_path,
+                                   learnings_file_path, debug);
   return selector.run(module, analyses);
 }

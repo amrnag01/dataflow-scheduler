@@ -103,9 +103,10 @@ source <path-to-samm-ktdf>/samm_env/bin/activate
 |--------|-------------|
 | `-kEmitDFIR` | Emit DataflowIR (required for code generation) |
 | `-device=<file>` | Path to device architecture specification (MLIR file describing hardware target) |
-| `-ktdf_bindings_dir <path>` | Path to MLIR Python bindings directory (`<dataflow-scheduler-build>/python_packages/scheduler`) |
-| `-cost_model_path <path>` | Path to samm-ktdf cost model directory |
+| `-ktdf_bindings_dir <path>` | Path to MLIR Python bindings directory (`<dataflow-scheduler-build>/python_packages/scheduler`); required when using agentic tile size selection |
+| `-cost_model_path <path>` | Path to samm-ktdf cost model directory; required when using agentic tile size selection |
 | `-anthropic-api-key <key>` | Anthropic API key for agentic tile size selection (or set `ANTHROPIC_API_KEY` environment variable) |
+| `-learnings_file <path>` | Path to `learnings.md` file for tile size guidance; required when using agentic tile size selection (the file can be empty) |
 
 ### Optional Options
 

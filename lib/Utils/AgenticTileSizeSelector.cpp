@@ -52,11 +52,24 @@ static size_t WriteCallback(void* contents, size_t size, size_t nmemb,
 
 AgenticTileSizeSelector::AgenticTileSizeSelector(
     const std::string& api_key, const std::string& ktdf_bindings_dir,
-    const std::string& cost_model_path, bool debug)
+    const std::string& cost_model_path,
+    const std::string& learnings_file_path, bool debug)
     : api_key_(api_key),
       ktdf_bindings_dir_(ktdf_bindings_dir),
       cost_model_path_(cost_model_path),
-      debug_(debug) {}
+      learnings_file_path_(learnings_file_path),
+      debug_(debug) {
+  // Load learnings file
+  std::ifstream learnings_file(learnings_file_path);
+  if (!learnings_file.is_open()) {
+    llvm::report_fatal_error(
+        llvm::Twine("Failed to open learnings file: ") + learnings_file_path);
+  }
+  learnings_content_ =
+      std::string((std::istreambuf_iterator<char>(learnings_file)),
+                  std::istreambuf_iterator<char>());
+  learnings_file.close();
+}
 
 AgenticTileSizeSelector::~AgenticTileSizeSelector() = default;
 
@@ -176,6 +189,26 @@ std::vector<int64_t> AgenticTileSizeSelector::run(
                            << input["explanation"].get<std::string>() << "\n";
             }
 
+            // Handle learnings_update
+            if (input.contains("learnings_update")) {
+              auto learnings_array = input["learnings_update"];
+              if (learnings_array.is_array() && !learnings_array.empty()) {
+                llvm::errs() << "[Agent] New Learnings:\n";
+                std::vector<std::string> new_learnings;
+                for (const auto& learning : learnings_array) {
+                  if (learning.is_string()) {
+                    std::string learning_str = learning.get<std::string>();
+                    llvm::errs() << learning_str << "\n";
+                    new_learnings.push_back(learning_str);
+                  }
+                }
+                // Append validated learnings to file
+                appendLearningstToFile(new_learnings);
+              } else {
+                llvm::errs() << "[Agent] No new learnings (prior learnings were sufficient)\n";
+              }
+            }
+
             return result;
           } else if (tool_name == "transform_and_evaluate_cost") {
             // Execute tool
@@ -259,24 +292,12 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(
   ss << "You are a compiler optimization expert tasked with selecting optimal "
         "tile sizes for loop tiling.\n\n";
 
-  ss << "You have access to a tool called transform_and_evaluate_cost that:\n";
-  ss << "1. Takes an array of tile-size assignments (id -> tile_size)\n";
-  ss << "2. Applies tiling to the IR (replaces reserve_size placeholders with "
-        "constants)\n";
-  ss << "3. Passes to SAMM cost model which:\n";
-  ss << "   - Parses the IR to extract operations and memory access patterns\n";
-  ss << "   - Builds a schedule tree with pipelined stages and dependencies\n";
-  ss << "   - Computes total bytes and ops for each tile size configuration\n";
-  ss << "4. Returns the measured latency in seconds\n\n";
+  ss << "=== LEARNINGS FROM PREVIOUS RUNS ===\n\n";
+  ss << learnings_content_ << "\n\n";
 
-  ss << "Tiling Decision Points:\n";
+  ss << "=== TILING DECISION POINTS ===\n";
   for (size_t i = 0; i < analyses.size(); ++i) {
     auto& analysis = const_cast<TileSizeInfo&>(analyses[i]);
-    int64_t min_value = analysis.reserve_size_op.getMinValue().getSExtValue();
-    int64_t divisibility =
-        analysis.reserve_size_op.getDivisibility().getSExtValue();
-    ss << "ID " << i << ": min_value=" << min_value
-       << ", divisibility=" << divisibility;
 
     // Add granularity information for this ID
     int64_t granularity = 1;
@@ -284,10 +305,10 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(
       auto it = loop_granularities_.find(loop_info.loop);
       if (it != loop_granularities_.end()) {
         granularity = it->second;
-        break;  // Use the first loop's granularity (all should be same)
+        break;
       }
     }
-    ss << ", granularity=" << granularity;
+    ss << "ID " << i << ": granularity=" << granularity;
 
     ss << "\n";
     ss << "  Associated loops (total_size): ";
@@ -298,56 +319,11 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(
     ss << "\n";
   }
 
-  ss << "\n=== INITIAL HEURISTIC ===\n";
-  ss << "A baseline greedy heuristic selects tile sizes "
-        "as follows:\n";
-  ss << "For each tiling decision point ID (independently):\n";
-  ss << "1. Start with candidate = max(2, min_value)\n";
-  ss << "2. Iterate candidate downward to min_value (stepping by 1)\n";
-  ss << "3. Skip any candidate where (candidate % divisibility != 0)\n";
-  ss << "4. For each candidate, check if it divides evenly into ALL associated "
-        "loop total_sizes\n";
-  ss << "   (i.e., for each associated loop, verify: total_size % candidate == "
-        "0)\n";
-  ss << "5. Return the smallest valid candidate that satisfies all "
-        "constraints\n";
-  ss << "YOUR FIRST CALL should evaluate the heuristic-selected tile sizes to "
-        "establish baseline latency.\n\n";
-
-  ss << "Your Task:\n";
-  ss << "1. First, apply the heuristic algorithm to compute initial tile size "
-        "for each decision point\n";
-  ss << "2. Call transform_and_evaluate_cost with these heuristic-selected "
-        "tile sizes\n";
-  ss << "3. Then explore tile size space systematically to find configurations "
-        "with better latency\n";
-  ss << "4. Use the cost model formulas to reason about latency "
-        "relationships\n";
-  ss << "5. When satisfied with your exploration, submit your best found "
-        "configuration\n";
-
-  ss << "Constraints:\n";
-  ss << "- Each tile size must be >= min_value\n";
-  ss << "- Each tile size must be divisible by its divisibility requirement\n";
-  ss << "- CRITICAL: Granularity constraints from parallel regions:\n";
-  for (size_t i = 0; i < analyses.size(); ++i) {
-    auto& analysis = const_cast<TileSizeInfo&>(analyses[i]);
-    int64_t granularity = 1;
-    for (const auto& loop_info : analysis.associated_loops) {
-      auto it = loop_granularities_.find(loop_info.loop);
-      if (it != loop_granularities_.end()) {
-        granularity = it->second;
-        break;
-      }
-    }
-    ss << "  * ID " << i << ": tile_size must be divisible by " << granularity;
-    if (granularity > 1) {
-      ss << " (LCM of num_instances from parallel regions in loops)";
-    }
-    ss << "\n";
-  }
-  ss << "- When satisfied with your exploration, call submit_final_answer with "
-        "the best assignment and your reasoning.\n";
+  ss << "\n=== YOUR TASK ===\n";
+  ss << "1. Use the learnings above to guide your tile-size exploration\n";
+  ss << "2. Call transform_and_evaluate_cost to explore tile-size candidates\n";
+  ss << "3. When satisfied, call submit_final_answer with your best choice and reasoning\n";
+  ss << "4. If previous learnings were sufficient to find the optimal solution, set learnings_update to empty array\n";
 
   return ss.str();
 }
@@ -380,19 +356,26 @@ std::string AgenticTileSizeSelector::buildToolSchemas() {
   json submit_tool;
   submit_tool["name"] = "submit_final_answer";
   submit_tool["description"] =
-      "Submit your final tile-size assignment once satisfied";
-  submit_tool["input_schema"] = {{"type", "object"},
-                                 {"properties",
-                                  {{"tile_sizes",
-                                    {{"type", "array"},
-                                     {"items",
-                                      {{"type", "object"},
-                                       {"properties",
-                                        {{"id", {{"type", "integer"}}},
-                                         {"tile_size", {{"type", "integer"}}}}},
-                                       {"required", {"id", "tile_size"}}}}}},
-                                   {"explanation", {{"type", "string"}}}}},
-                                 {"required", {"tile_sizes", "explanation"}}};
+      "Submit your final tile-size assignment once satisfied. Include new learnings if discovered, or empty array if prior learnings were sufficient.";
+  submit_tool["input_schema"] = {
+      {"type", "object"},
+      {"properties",
+       {{"tile_sizes",
+         {{"type", "array"},
+          {"items",
+           {{"type", "object"},
+            {"properties",
+             {{"id", {{"type", "integer"}}},
+              {"tile_size", {{"type", "integer"}}}}},
+            {"required", {"id", "tile_size"}}}}}},
+        {"explanation", {{"type", "string"}}},
+        {"learnings_update",
+         {{"type", "array"},
+          {"items", {{"type", "string"}}},
+          {"description",
+           "Array of new learnings discovered (as markdown strings in Learning "
+           "template format), or empty array if no new learnings found"}}}}},
+      {"required", {"tile_sizes", "explanation", "learnings_update"}}};
   schemas.push_back(submit_tool);
 
   return schemas.dump();
@@ -696,6 +679,52 @@ bool AgenticTileSizeSelector::validateTileSizeGranularities(
   }
 
   return true;
+}
+
+void AgenticTileSizeSelector::appendLearningstToFile(
+    const std::vector<std::string>& learnings) {
+  if (learnings.empty()) {
+    return;
+  }
+
+  // Validate that each learning matches the template structure
+  for (const auto& learning : learnings) {
+    // Check for required sections: ### Learning:, **Key Insight**:, **Pattern**:, **Example**:, Analysis:
+    if (learning.find("### Learning:") == std::string::npos) {
+      llvm::errs() << "[Agent] Warning: Learning missing '### Learning:' header\n";
+      continue;
+    }
+    if (learning.find("**Key Insight**:") == std::string::npos) {
+      llvm::errs() << "[Agent] Warning: Learning missing '**Key Insight**:' section\n";
+      continue;
+    }
+    if (learning.find("**Pattern**:") == std::string::npos) {
+      llvm::errs() << "[Agent] Warning: Learning missing '**Pattern**:' section\n";
+      continue;
+    }
+    if (learning.find("**Example**:") == std::string::npos) {
+      llvm::errs() << "[Agent] Warning: Learning missing '**Example**:' section\n";
+      continue;
+    }
+    if (learning.find("Analysis:") == std::string::npos) {
+      llvm::errs() << "[Agent] Warning: Learning missing 'Analysis:' section\n";
+      continue;
+    }
+
+    // Append to file
+    std::ofstream learnings_file(learnings_file_path_, std::ios::app);
+    if (!learnings_file.is_open()) {
+      llvm::errs() << "[Agent] Error: Failed to open learnings file for appending: "
+                   << learnings_file_path_ << "\n";
+      continue;
+    }
+
+    learnings_file << "\n---\n\n" << learning << "\n";
+    learnings_file.close();
+
+    llvm::errs() << "[Agent] Successfully appended new learning to " << learnings_file_path_
+                 << "\n";
+  }
 }
 
 }  // namespace scheduler
