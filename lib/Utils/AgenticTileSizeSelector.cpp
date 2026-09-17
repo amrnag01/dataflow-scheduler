@@ -324,6 +324,19 @@ std::string AgenticTileSizeSelector::buildSystemPrompt(
   ss << "2. Call transform_and_evaluate_cost to explore tile-size candidates\n";
   ss << "3. When satisfied, call submit_final_answer with your best choice and reasoning\n";
   ss << "4. If previous learnings were sufficient to find the optimal solution, set learnings_update to empty array\n";
+  ss << "5. When adding new learnings, use EXACTLY this template (do not deviate):\n\n";
+  ss << "### Learning: [Short Title]\n\n";
+  ss << "**Key Insight**: [One-sentence general rule discovered]\n\n";
+  ss << "**Pattern**: [Describe the pattern: when does this apply and what should be done]\n\n";
+  ss << "**Example**:\n";
+  ss << "```\n";
+  ss << "[Loop structure or code snippet showing the pattern]\n\n";
+  ss << "Analysis:\n";
+  ss << "  - [Key observation 1]\n";
+  ss << "  - [Key observation 2]\n";
+  ss << "  - Decision: [Resulting tile-size choice and why]\n";
+  ss << "```\n\n";
+  ss << "IMPORTANT: Every learning must include all four sections (Key Insight, Pattern, Example with Analysis) in exactly this order. Start each new learning on a new line.\n";
 
   return ss.str();
 }
