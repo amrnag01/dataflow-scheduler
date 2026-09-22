@@ -147,7 +147,25 @@ void scheduler::buildDFIRBackendPipeline(
 
 void scheduler::buildKTDPToDFIRPipeline(
     mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
-  buildKTIRFrontendPipeline(pm, scheduler_ctx);
-  buildSchedulerOptimizationPipeline(pm, scheduler_ctx);
-  buildDFIRBackendPipeline(pm, scheduler_ctx);
+  // Custom fixed pipeline with specific pass ordering
+  pm.addPass(createKTIRLegalityCheckPass());
+  pm.addPass(createComputeGroupExtractionPass());
+  pm.addPass(createConstructThreeStagePipelinePass(scheduler_ctx));
+  pm.nest<mlir::ModuleOp>().nest<mlir::func::FuncOp>().addPass(
+      createApplyDevicePatternsPass({"pre_scheduling"}));
+  pm.addPass(createMaterializeRegistersPass());
+  pm.addPass(createPathExpansionPass(scheduler_ctx));
+  pm.addPass(createScalarBroadcastLegalizationPass());
+  pm.addPass(createNormalizeSCFForLoopsPass());
+  pm.addPass(mlir::createCanonicalizerPass());
+  pm.addPass(createTileSCFForLoopsPass());
+  pm.addPass(mlir::createCanonicalizerPass());
+  pm.addPass(mlir::ktdf::createTileSizeSelectionPass());
+  pm.addPass(createAffineMinCanonicalizationPass());
+  pm.addPass(mlir::ktdf::createSubsumeLinearizeIndexPass());
+  pm.addPass(createAddressAssignmentPass(scheduler_ctx));
+  pm.addPass(createNormalizeGridTo1DPass());
+  pm.addPass(createKTDFToKTDFLoweringPass(scheduler_ctx));
+  pm.addPass(createKTDFLowToDFIRPass());
+  pm.addPass(createWrapProgramDFIRPass());
 }
