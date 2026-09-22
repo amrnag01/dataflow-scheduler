@@ -163,9 +163,13 @@ void scheduler::buildKTDPToDFIRPipeline(
   pm.addPass(mlir::ktdf::createTileSizeSelectionPass());
   pm.addPass(createAffineMinCanonicalizationPass());
   pm.addPass(mlir::ktdf::createSubsumeLinearizeIndexPass());
+  pm.nest<mlir::ModuleOp>().addNestedPass<mlir::func::FuncOp>(
+      createApplyDevicePatternsPass({"post_scheduling"}));
   pm.addPass(createAddressAssignmentPass(scheduler_ctx));
   pm.addPass(createNormalizeGridTo1DPass());
   pm.addPass(createKTDFToKTDFLoweringPass(scheduler_ctx));
+  pm.nest<mlir::ModuleOp>().addNestedPass<mlir::func::FuncOp>(
+      createApplyDevicePatternsPass({"post_lowering"}));
   pm.addPass(createKTDFLowToDFIRPass());
   pm.addPass(createWrapProgramDFIRPass());
 }
