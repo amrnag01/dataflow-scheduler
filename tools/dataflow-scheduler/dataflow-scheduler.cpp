@@ -25,29 +25,78 @@
 #include <mlir/Pass/Pass.h>
 #include <mlir/Pass/PassManager.h>
 
+#include <cstdlib>
+#include <memory>
+
 #include "dataflow-scheduler-main.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/Passes.h"
 #include "dataflow-scheduler/Pipeline.h"
 #include "dataflow-scheduler/RegisterEverything.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 
+// Static storage for the scheduler context to ensure it outlives pass execution
+static std::unique_ptr<scheduler::SchedulerExtContext> g_scheduler_context;
+
+// Global CLI options
+static llvm::cl::opt<std::string> splitDFIROutputDir(
+    "split-dfir-output-dir",
+    llvm::cl::desc("Output directory for split DFIR files produced by "
+                   "-kEmitDFIR (default: same directory as input file)"),
+    llvm::cl::init(""));
+
+static llvm::cl::opt<std::string> anthropicApiKey(
+    "anthropic-api-key",
+    llvm::cl::desc("Anthropic API key for agent-driven tile size selection"),
+    llvm::cl::init(""));
+
+static llvm::cl::opt<std::string> ktdfBindingsDir(
+    "ktdf_bindings_dir",
+    llvm::cl::desc("Path to MLIR Python bindings directory for cost model"),
+    llvm::cl::init(""));
+
+static llvm::cl::opt<std::string> costModelPath(
+    "cost_model_path",
+    llvm::cl::desc("Path to samm-ktdf cost model directory"),
+    llvm::cl::init(""));
+
+static llvm::cl::opt<bool> agentDebug(
+    "agent-debug",
+    llvm::cl::desc("Enable debug mode for agent: dump all IRs passed to cost model"),
+    llvm::cl::init(false));
+
 void registerPassPipelinesForScheduler() {
-  static llvm::cl::opt<std::string> splitDFIROutputDir(
-      "split-dfir-output-dir",
-      llvm::cl::desc("Output directory for split DFIR files produced by "
-                     "-kEmitDFIR (default: same directory as input file)"),
-      llvm::cl::init(""));
 
   mlir::PassPipelineRegistration<>(
       "kEmitDFIR", "Emit DataflowIR", [&](mlir::OpPassManager& pm) {
-        scheduler::buildKTDPToDFIRPipeline(
-            pm, scheduler::SchedulerExtContext::dummyContext());
+        // Try to get API key from environment or CLI flag
+        std::string api_key = anthropicApiKey;
+        if (api_key.empty()) {
+          const char* env_key = std::getenv("ANTHROPIC_API_KEY");
+          if (env_key) {
+            api_key = env_key;
+          }
+        }
+
+        if (!api_key.empty()) {
+          g_scheduler_context =
+              std::make_unique<scheduler::AgentDrivenSchedulerContext>(
+                  api_key, ktdfBindingsDir, costModelPath, agentDebug);
+        } else {
+          g_scheduler_context =
+              std::make_unique<scheduler::DummySchedulerExtContext>();
+          llvm::errs() << "Warning: No Anthropic API key provided. "
+                          "Set ANTHROPIC_API_KEY environment variable or use "
+                          "--anthropic-api-key flag.\n";
+        }
+
+        scheduler::buildKTDPToDFIRPipeline(pm, *g_scheduler_context);
         pm.addPass(scheduler::createSplitDFIROutputPass(splitDFIROutputDir));
       });
 }
 
-// FIXME: Internal testing has moved to dataflow-scheduler-opt, and the tool is
-//        integrated as a pipeline downstream. Delete this executable?
+// FIXME: We should use dataflow-scheduler-opt for internal testing, and turn
+//        this executable into a self-contained tool front-end, without the
+//        default MLIR CLI etc.
 auto main(int argc, char** argv) -> int {
   scheduler::registerAllPasses();
   registerPassPipelinesForScheduler();
