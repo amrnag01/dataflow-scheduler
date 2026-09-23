@@ -62,8 +62,27 @@ void buildDFIRBackendPipeline(
     mlir::OpPassManager& pm,
     const scheduler::SchedulerExtContext& scheduler_ctx);
 
+/// Builds the KTDF legality passes: converts KTIR to legal KTDF and applies
+/// scheduling optimizations including tiling, address assignment, and grid normalization.
+/// Includes all passes up to and including NormalizeGridTo1DPass.
+void buildKTDFLegalityPasses(
+    mlir::OpPassManager& pm,
+    const scheduler::SchedulerExtContext& scheduler_ctx);
+
+/// Builds the KTDF optimization passes: applies optimizations to legal KTDF
+/// between the legality and lowering stages.
+void buildKTDFOptimizationPasses(
+    mlir::OpPassManager& pm,
+    const scheduler::SchedulerExtContext& scheduler_ctx);
+
+/// Builds the KTDF lowering passes: lowers legal KTDF through KTDFLow into
+/// Dataflow IR (DFIR). Includes all passes from KTDFToKTDFLoweringPass onward.
+void buildKTDFLoweringPasses(
+    mlir::OpPassManager& pm,
+    const scheduler::SchedulerExtContext& scheduler_ctx);
+
 /// Builds the full KTDP to DFIR pipeline with the given pass manager, by
-/// chaining the KTIR frontend, scheduler optimization and DFIR backend stages.
+/// chaining the KTDF legality and lowering stages.
 ///
 /// Note: this does not emit the DFIR output. Callers that want the resulting
 /// DFIR written out should append `createSplitDFIROutputPass()` themselves.

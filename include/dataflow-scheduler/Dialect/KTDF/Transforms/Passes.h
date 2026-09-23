@@ -50,6 +50,8 @@ auto createSubsumeLinearizeIndexPass() -> std::unique_ptr<Pass>;
 
 auto createTileSizeSelectionPass() -> std::unique_ptr<Pass>;
 
+auto createKTDFOptimizationPass() -> std::unique_ptr<Pass>;
+
 #define GEN_PASS_DECL
 #define GEN_PASS_REGISTRATION
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h.inc"
