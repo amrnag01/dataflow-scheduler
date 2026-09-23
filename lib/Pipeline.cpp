@@ -170,7 +170,7 @@ void scheduler::buildKTDFLegalityPasses(
 
 void scheduler::buildKTDFOptimizationPasses(
     mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
-  pm.addPass(mlir::ktdf::createKTDFOptimizationPass());
+  pm.addPass(mlir::ktdf::createKTDFOptimizationPass(scheduler_ctx));
 }
 
 void scheduler::buildKTDFLoweringPasses(

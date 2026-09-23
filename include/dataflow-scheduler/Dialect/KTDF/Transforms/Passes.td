@@ -345,4 +345,20 @@ def ReductionDimChunkingPass : Pass<"reduction-dim-chunking", "mlir::ModuleOp"> 
   ];
 }
 
+def KTDFOptimizationPass : Pass<"ktdf-optimization", "mlir::ModuleOp"> {
+  let summary = "Agentic KTDF optimization pass";
+  let description = [{
+    This pass invokes an AI agent to optimize KTDF IR transformations.
+    The agent analyzes the IR and makes optimization decisions guided by
+    learned patterns from previous transformations.
+  }];
+  let constructor = "::mlir::ktdf::createKTDFOptimizationPass()";
+  let options = [
+    Option<"anthropicApiKey", "anthropic-api-key", "std::string",
+           /*default=*/"",
+           "Anthropic API key for agent invocation">
+  ];
+  let dependentDialects = ["mlir::ktdf::KTDFDialect"];
+}
+
 #endif // DATAFLOW_SCHEDULER_DIALECT_KTDF_TRANSFORMS_PASSES_TD

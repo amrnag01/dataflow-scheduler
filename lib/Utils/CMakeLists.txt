@@ -1,5 +1,6 @@
 add_dataflow_scheduler_library(DataflowSchedulerUtils
     SchedulerExtContext.cpp
+    AnthropicAgentClient.cpp
 
   ADDITIONAL_HEADER_DIRS
     ${DataflowScheduler_SOURCE_DIR}/include/dataflow-scheduler/Utils
@@ -17,3 +18,5 @@ add_dataflow_scheduler_library(DataflowSchedulerUtils
   LINK_MLIR_LIBS
     MLIRIR
 )
+
+target_link_libraries(DataflowSchedulerUtils PRIVATE CURL::libcurl nlohmann_json::nlohmann_json)

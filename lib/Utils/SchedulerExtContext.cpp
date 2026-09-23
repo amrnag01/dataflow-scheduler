@@ -23,6 +23,7 @@
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
+#include "dataflow-scheduler/Utils/AnthropicAgentClient.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "mlir/IR/Builders.h"
 
@@ -37,3 +38,16 @@ const SchedulerExtContext& SchedulerExtContext::dummyContext() {
   static const DummySchedulerExtContext dummy_ctx;
   return dummy_ctx;
 }
+
+AgentDrivenSchedulerContext::AgentDrivenSchedulerContext(
+    const std::string& api_key,
+    const std::string& ktdf_bindings_dir,
+    const std::string& cost_model_path,
+    bool debug)
+    : agent_client(std::make_unique<AnthropicAgentClient>(api_key)),
+      ktdf_bindings_dir(ktdf_bindings_dir),
+      cost_model_path(cost_model_path),
+      api_key(api_key),
+      debug(debug) {}
+
+AgentDrivenSchedulerContext::~AgentDrivenSchedulerContext() = default;

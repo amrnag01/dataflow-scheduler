@@ -22,7 +22,19 @@
 #include <mlir/IR/Attributes.h>
 #include <mlir/IR/BuiltinOps.h>
 
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "llvm/ADT/ArrayRef.h"
+
 namespace scheduler {
+
+// Forward declarations
+struct TileSizeInfo;
+class AnthropicAgentClient;
+class AgenticTileSizeSelector;
 
 struct SchedulerExtContext {
   SchedulerExtContext();
@@ -34,6 +46,24 @@ struct SchedulerExtContext {
   static const SchedulerExtContext& dummyContext();
 
   virtual bool isDummy() const { return false; }
+
+  /// @brief Select a tile size for the given tile size problem.
+  /// Must be overridden by contexts that support agent-driven optimization.
+  virtual int64_t selectTileSize(
+      mlir::ModuleOp module,
+      TileSizeInfo& tile_size_info) {
+    llvm::report_fatal_error(
+        "selectTileSize not implemented for this context");
+  }
+
+  /// @brief Select all tile sizes for a module at once using agentic loop.
+  /// Must be overridden by contexts that support agent-driven optimization.
+  virtual std::vector<int64_t> selectAllTileSizes(
+      mlir::ModuleOp module,
+      llvm::ArrayRef<TileSizeInfo> analyses) {
+    llvm::report_fatal_error(
+        "selectAllTileSizes not implemented for this context");
+  }
 };
 
 /// @brief Construct a DummySchedulerExtContext. In general prefer
@@ -41,6 +71,23 @@ struct SchedulerExtContext {
 struct DummySchedulerExtContext : SchedulerExtContext {
   DummySchedulerExtContext() : SchedulerExtContext() {}
   bool isDummy() const override { return true; }
+};
+
+/// @brief Context with agent-driven optimization.
+struct AgentDrivenSchedulerContext : SchedulerExtContext {
+  std::unique_ptr<AnthropicAgentClient> agent_client;
+  std::string ktdf_bindings_dir;
+  std::string cost_model_path;
+  std::string api_key;
+  bool debug;
+
+  AgentDrivenSchedulerContext(
+      const std::string& api_key,
+      const std::string& ktdf_bindings_dir,
+      const std::string& cost_model_path,
+      bool debug = false);
+  ~AgentDrivenSchedulerContext();
+
 };
 
 }  // namespace scheduler

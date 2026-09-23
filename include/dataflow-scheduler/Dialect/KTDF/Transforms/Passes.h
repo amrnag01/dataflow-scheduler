@@ -58,4 +58,14 @@ auto createKTDFOptimizationPass() -> std::unique_ptr<Pass>;
 
 }  // namespace mlir::ktdf
 
+namespace scheduler {
+struct SchedulerExtContext;
+}
+
+namespace mlir::ktdf {
+std::unique_ptr<Pass> createKTDFOptimizationPass(
+    const scheduler::SchedulerExtContext& scheduler_ctx);
+
+}  // namespace mlir::ktdf
+
 #endif  // DATAFLOW_SCHEDULER_DIALECT_KTDF_TRANSFORMS_PASSES_H_
