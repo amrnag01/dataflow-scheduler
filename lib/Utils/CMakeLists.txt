@@ -1,6 +1,7 @@
 add_dataflow_scheduler_library(DataflowSchedulerUtils
     SchedulerExtContext.cpp
     AnthropicAgentClient.cpp
+    KTDFOptimizationAgent.cpp
 
   ADDITIONAL_HEADER_DIRS
     ${DataflowScheduler_SOURCE_DIR}/include/dataflow-scheduler/Utils

@@ -21,7 +21,7 @@
 #include <memory>
 
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
-#include "dataflow-scheduler/Utils/AnthropicAgentClient.h"
+#include "dataflow-scheduler/Utils/KTDFOptimizationAgent.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -58,15 +58,30 @@ struct KTDFOptimizationPass
       return;
     }
 
-    auto agent = std::make_unique<scheduler::AnthropicAgentClient>(api_key);
-    int64_t result = agent->optimizeKTDF(module);
-
-    if (result == 2) {
-      llvm::errs() << "[KTDFOptimization] SUCCESS: Agent returned correct value\n";
-    } else {
-      llvm::errs() << "[KTDFOptimization] FAILED: Agent returned " << result
-                   << " instead of 2\n";
+    // Get context paths
+    std::string ktdf_bindings_dir;
+    std::string cost_model_path;
+    if (scheduler_ctx && !scheduler_ctx->isDummy()) {
+      auto agent_ctx = static_cast<const scheduler::AgentDrivenSchedulerContext*>(scheduler_ctx);
+      ktdf_bindings_dir = agent_ctx->ktdf_bindings_dir;
+      cost_model_path = agent_ctx->cost_model_path;
     }
+
+    auto agent = std::make_unique<scheduler::KTDFOptimizationAgent>(
+        api_key, ktdf_bindings_dir, cost_model_path);
+    mlir::ModuleOp optimized = agent->optimizeKTDF(module);
+
+    if (optimized && optimized != module) {
+      // Replace the original module's body with the optimized one
+      OpBuilder builder(module.getContext());
+      module.getBody()->clear();
+      for (auto& op : optimized.getOps()) {
+        module.getBody()->push_back(op.clone());
+      }
+      llvm::errs() << "[KTDFOptimization] Successfully replaced module with optimized IR\n";
+    }
+
+    llvm::errs() << "[KTDFOptimization] Optimization complete\n";
   }
 };
 
