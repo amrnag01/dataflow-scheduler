@@ -57,7 +57,6 @@ KTDFOptimizationAgent::KTDFOptimizationAgent(
 KTDFOptimizationAgent::~KTDFOptimizationAgent() = default;
 
 mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
-  llvm::errs() << "[KTDFOptimizationAgent] Starting optimization loop\n";
 
   // Get IR string
   std::string ir_str;
@@ -92,7 +91,7 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
 
   while (iteration < max_iterations) {
     iteration++;
-    llvm::errs() << "[KTDFOptimizationAgent] Iteration " << iteration << "\n";
+    llvm::errs() << "[Agent] Iteration " << iteration << "\n";
 
     // Build request
     json request_body;
@@ -161,24 +160,14 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
 
     std::string full_response_text;
 
-    llvm::errs() << "[KTDFOptimizationAgent] Full response JSON:\n"
-                 << response_obj.dump(2) << "\n";
-
     if (response_obj.contains("content") &&
         response_obj["content"].is_array()) {
-      llvm::errs() << "[KTDFOptimizationAgent] Content blocks count: "
-                   << response_obj["content"].size() << "\n";
-
       for (const auto& block : response_obj["content"]) {
         if (block.contains("type")) {
           std::string block_type = block["type"];
-          llvm::errs() << "[KTDFOptimizationAgent] Block type: " << block_type
-                       << "\n";
 
           if (block_type == "text") {
             std::string text = block["text"];
-            llvm::errs() << "[KTDFOptimizationAgent] Text block: " << text
-                         << "\n";
             full_response_text += text + "\n";
 
             json text_content;
@@ -186,14 +175,10 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
             text_content["text"] = text;
             assistant_msg["content"].push_back(text_content);
           } else if (block_type == "thinking") {
-            std::string thinking = block["thinking"];
-            llvm::errs() << "[KTDFOptimizationAgent] Thinking block (len: "
-                         << thinking.size() << "): " << thinking << "\n";
-            // Don't add thinking to full_response_text
+            // Skip thinking blocks
           } else if (block_type == "tool_use") {
             std::string tool_name = block["name"];
-            llvm::errs() << "[KTDFOptimizationAgent] Tool use: " << tool_name
-                         << "\n";
+            llvm::errs() << "[Agent] Tool: " << tool_name << "\n";
 
             json tool_use_content;
             tool_use_content["type"] = "tool_use";
@@ -204,26 +189,23 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
 
             // Handle tool execution
             if (tool_name == "submit_final_answer") {
-              // Try to get IR from tool input field first
               json input = block["input"];
-              llvm::errs()
-                  << "[KTDFOptimizationAgent] submit_final_answer input: "
-                  << input.dump() << "\n";
+
+              std::string explanation;
+              if (input.contains("explanation")) {
+                explanation = input["explanation"].get<std::string>();
+                llvm::errs() << "[Agent] Explanation: " << explanation << "\n";
+              }
 
               std::string optimized_ir;
 
               if (input.contains("optimized_ir") &&
                   input["optimized_ir"].is_string()) {
                 optimized_ir = input["optimized_ir"].get<std::string>();
-                llvm::errs() << "[KTDFOptimizationAgent] Found optimized_ir in "
-                                "tool input (size: "
-                             << optimized_ir.size() << " bytes)\n";
               }
 
               // If not in tool input, look in response text
               if (optimized_ir.empty()) {
-                llvm::errs() << "[KTDFOptimizationAgent] optimized_ir not in "
-                                "input, looking in response text...\n";
                 size_t ir_start = full_response_text.find("```mlir");
                 if (ir_start != std::string::npos) {
                   ir_start += 7;  // Skip "```mlir"
@@ -266,18 +248,11 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
                 temp_file << optimized_ir;
                 temp_file.close();
 
-                llvm::errs() << "[KTDFOptimizationAgent] Wrote optimized IR to "
-                             << temp_path << "\n";
-
                 // Store temp file path for pass to read
-                // We return the original module for now; the pass will handle the
-                // file-based replacement
                 optimized_ir_path_ = temp_path.str().str();
                 return module;
               }
 
-              llvm::errs() << "[KTDFOptimizationAgent] No optimized IR found, "
-                              "using original module\n";
               // Fallback: return original module
               return module;
             } else if (tool_name == "evaluate_cost" && !handled_tool) {
@@ -287,15 +262,12 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
               std::string ir_param = input["ir"].get<std::string>();
               std::string reasoning = input["reasoning"].get<std::string>();
 
-              llvm::errs() << "[KTDFOptimizationAgent] Evaluating cost\n";
-              llvm::errs() << "Reasoning: " << reasoning << "\n";
+              llvm::errs() << "[Agent] Reasoning: " << reasoning << "\n";
 
               auto eval_result = evaluateCost(ir_param);
 
               if (eval_result.success) {
-                llvm::errs() << "Latency: " << eval_result.latency << " sec\n";
-              } else {
-                llvm::errs() << "Error: " << eval_result.error_message << "\n";
+                llvm::errs() << "[Agent] Latency: " << eval_result.latency << " sec\n";
               }
 
               // Add assistant message to history
@@ -352,14 +324,11 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
       // Check for stop_reason
       if (response_obj.contains("stop_reason") &&
           response_obj["stop_reason"] == "end_turn") {
-        llvm::errs()
-            << "[KTDFOptimizationAgent] Agent ended turn without tool use\n";
         return module;
       }
     }
   }
 
-  llvm::errs() << "[KTDFOptimizationAgent] Max iterations reached\n";
   return module;
 }
 
