@@ -39,10 +39,14 @@ public:
   /// Optimize the given module. Returns the optimized ModuleOp from the agent.
   mlir::ModuleOp optimizeKTDF(mlir::ModuleOp module);
 
+  /// Get path to optimized IR temp file (if one was created)
+  std::string getOptimizedIRPath() const { return optimized_ir_path_; }
+
 private:
   std::string api_key_;
   std::string ktdf_bindings_dir_;
   std::string cost_model_path_;
+  std::string optimized_ir_path_;
 
   struct CostEvaluation {
     bool success;
