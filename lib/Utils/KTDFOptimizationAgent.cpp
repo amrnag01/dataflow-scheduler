@@ -18,7 +18,9 @@
 
 #include "dataflow-scheduler/Utils/KTDFOptimizationAgent.h"
 
+#include <fstream>
 #include <iomanip>
+#include <regex>
 
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/SourceMgr.h"
@@ -72,14 +74,11 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
   initial_content
       << "KTDF IR to optimize:\n\n```mlir\n"
       << ir_str << "\n```\n\n"
-      << "TASK:\n"
-      << "1. Call the evaluate_cost tool once to measure baseline latency\n"
-      << "2. Then call submit_final_answer\n"
-      << "3. In your response, include the optimized IR in a ```mlir code "
-         "block\n\n"
-      << "For this test, return the IR unchanged. Include it in your response "
-         "as:\n"
-      << "```mlir\n[the complete IR here]\n```\n";
+      << "TASK (2 iterations):\n"
+      << "1. Iteration 1: Call evaluate_cost with the IR above to measure "
+         "baseline latency\n"
+      << "2. Iteration 2: Call submit_final_answer with optimized IR\n\n"
+      << "For this test, return the IR unchanged and explain what you measured.\n";
 
   json messages = json::array();
   json user_msg;
@@ -285,12 +284,13 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
               handled_tool = true;
 
               json input = block["input"];
+              std::string ir_param = input["ir"].get<std::string>();
               std::string reasoning = input["reasoning"].get<std::string>();
 
               llvm::errs() << "[KTDFOptimizationAgent] Evaluating cost\n";
               llvm::errs() << "Reasoning: " << reasoning << "\n";
 
-              auto eval_result = evaluateCost(module);
+              auto eval_result = evaluateCost(ir_param);
 
               if (eval_result.success) {
                 llvm::errs() << "Latency: " << eval_result.latency << " sec\n";
@@ -413,13 +413,19 @@ std::string KTDFOptimizationAgent::buildSystemPrompt() {
   std::ostringstream ss;
   ss << "You are a compiler optimization expert specializing in KTDF IR "
         "optimization.\n\n";
+  ss << "You have two tools available:\n";
+  ss << "1. evaluate_cost: Takes IR string and reasoning, returns latency in "
+        "seconds from SAMM cost model\n";
+  ss << "2. submit_final_answer: Returns optimized IR and explanation\n\n";
   ss << "CRITICAL - REQUIRED TOOL BEHAVIOR:\n";
-  ss << "When you call the submit_final_answer tool, you MUST include BOTH of "
-        "these fields in the tool input:\n";
-  ss << "1. explanation: A brief description of what you did (can be empty "
-        "string if no changes)\n";
-  ss << "2. optimized_ir: The COMPLETE MLIR module as a string. This field is "
-        "MANDATORY. The compiler will fail if it is missing or empty.\n\n";
+  ss << "First iteration:\n";
+  ss << "  - Call evaluate_cost with the UNCHANGED original IR to get baseline "
+        "latency\n";
+  ss << "  - Both 'ir' and 'reasoning' fields are REQUIRED\n\n";
+  ss << "Second iteration:\n";
+  ss << "  - Call submit_final_answer with:\n";
+  ss << "    1. optimized_ir: The COMPLETE MLIR module (for now, unchanged)\n";
+  ss << "    2. explanation: What you attempted\n\n";
   ss << "Your task: Optimize the given KTDF IR to minimize latency while "
         "maintaining functional correctness.\n";
   return ss.str();
@@ -432,13 +438,16 @@ std::string KTDFOptimizationAgent::buildToolSchemas() {
   json evaluate_tool;
   evaluate_tool["name"] = "evaluate_cost";
   evaluate_tool["description"] =
-      "Evaluate latency of current IR using SAMM cost model";
+      "Evaluate latency of given IR using SAMM cost model";
   json eval_schema;
   eval_schema["type"] = "object";
+  eval_schema["properties"]["ir"] = {
+      {"type", "string"},
+      {"description", "The KTDF IR to evaluate as a complete MLIR module"}};
   eval_schema["properties"]["reasoning"] = {
       {"type", "string"},
       {"description", "Why you are evaluating this configuration"}};
-  eval_schema["required"] = json::array({"reasoning"});
+  eval_schema["required"] = json::array({"ir", "reasoning"});
   evaluate_tool["input_schema"] = eval_schema;
   schemas.push_back(evaluate_tool);
 
@@ -466,10 +475,93 @@ std::string KTDFOptimizationAgent::buildToolSchemas() {
 }
 
 KTDFOptimizationAgent::CostEvaluation KTDFOptimizationAgent::evaluateCost(
-    mlir::ModuleOp module) {
-  llvm::errs() << "[KTDFOptimizationAgent] Placeholder: evaluating cost\n";
-  // Placeholder: for now just return a dummy latency value
-  return {true, 1.0, {}, ""};
+    const std::string& ir_str) {
+  // Validate that cost model paths are set
+  if (cost_model_path_.empty() || ktdf_bindings_dir_.empty()) {
+    llvm::report_fatal_error(
+        "[KTDFOptimizationAgent] cost_model_path and ktdf_bindings_dir must be "
+        "provided via CLI flags");
+  }
+
+  // Write IR to temp file
+  llvm::SmallString<256> temp_file;
+  std::error_code ec =
+      llvm::sys::fs::createTemporaryFile("ktdf_eval", ".mlir", temp_file);
+  if (ec) {
+    llvm::report_fatal_error("[KTDFOptimizationAgent] Failed to create temp file");
+  }
+
+  std::ofstream f(temp_file.c_str());
+  f << ir_str;
+  f.close();
+
+  // Construct command: cd <cost_model_path> && source samm_env/bin/activate &&
+  // python3.12 main.py ...
+  std::string cmd = "cd '" + cost_model_path_ +
+                    "' && source samm_env/bin/activate && python3.12 main.py "
+                    "--mlir-bindings-dir '" +
+                    ktdf_bindings_dir_ + "' --input-file '" +
+                    temp_file.str().str() + "' --verbose";
+
+  // Execute command and capture output
+  llvm::SmallString<256> temp_out;
+  ec = llvm::sys::fs::createTemporaryFile("cost_model_out", ".txt", temp_out);
+  if (ec) {
+    llvm::sys::fs::remove(temp_file);
+    llvm::report_fatal_error(
+        "[KTDFOptimizationAgent] Failed to create output temp file");
+  }
+
+  std::string full_cmd = cmd + " > " + temp_out.str().str() + " 2>&1";
+  int ret_code = system(full_cmd.c_str());
+
+  // Read output
+  std::string output_content;
+  std::ifstream output_stream(temp_out.c_str());
+  if (output_stream.is_open()) {
+    output_content =
+        std::string((std::istreambuf_iterator<char>(output_stream)),
+                    std::istreambuf_iterator<char>());
+    output_stream.close();
+  }
+
+  // Clean up temp files
+  llvm::sys::fs::remove(temp_file);
+  llvm::sys::fs::remove(temp_out);
+
+  if (ret_code != 0) {
+    llvm::errs() << "\n=== COST MODEL FAILED ===\n";
+    llvm::errs() << "Cost model command: " << cmd << "\n";
+    llvm::errs() << "Exit code: " << ret_code << "\n";
+    llvm::errs() << "Output:\n" << output_content << "\n";
+    llvm::report_fatal_error(
+        "[KTDFOptimizationAgent] Cost model subprocess failed");
+  }
+
+  // Parse latency from output - look for last occurrence of "Latency: X sec"
+  std::regex latency_regex(R"(Latency:\s*([\d.eE+\-]+)\s*sec)");
+  std::smatch match;
+  std::string::const_iterator search_start(output_content.cbegin());
+  std::string last_match;
+  double last_latency = 0.0;
+
+  // Find all matches and use the last one
+  while (std::regex_search(search_start, output_content.cend(), match,
+                           latency_regex)) {
+    last_match = match[1];
+    last_latency = std::stod(match[1]);
+    search_start = match.suffix().first;
+  }
+
+  if (!last_match.empty()) {
+    return {true, last_latency, {}, ""};
+  }
+
+  llvm::errs() << "\n=== COST MODEL OUTPUT PARSING FAILED ===\n";
+  llvm::errs() << "Could not find 'Latency: X sec' in output:\n"
+               << output_content << "\n";
+  llvm::report_fatal_error(
+      "[KTDFOptimizationAgent] Could not parse latency from cost model output");
 }
 
 }  // namespace scheduler

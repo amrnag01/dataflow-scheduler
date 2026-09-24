@@ -60,7 +60,7 @@ private:
   std::string buildSystemPrompt();
   std::string buildToolSchemas();
 
-  CostEvaluation evaluateCost(mlir::ModuleOp module);
+  CostEvaluation evaluateCost(const std::string& ir_str);
 };
 
 }  // namespace scheduler
