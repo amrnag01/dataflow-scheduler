@@ -38,6 +38,7 @@ struct SchedulerExtContext;
 
 namespace scheduler {
 
+std::unique_ptr<mlir::Pass> createLoopReorderingPass();
 std::unique_ptr<mlir::Pass> createNormalizeSCFForLoopsPass();
 std::unique_ptr<mlir::Pass> createTileSCFForLoopsPass();
 std::unique_ptr<mlir::Pass> createStripMineSCFForLoopsPass();

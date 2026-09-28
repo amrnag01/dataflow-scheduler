@@ -6,6 +6,7 @@ add_dataflow_scheduler_library(DataflowSchedulerTransforms
     PathExpansion/PlannerFactories.cpp
     CustomLinalgBufferization.cpp
     AddressAssignment.cpp
+    LoopReordering.cpp
     IndirectAddrBufLegalization.cpp
     IndirectAccessLoopMaterialization.cpp
     AffineMinCanonicalization.cpp

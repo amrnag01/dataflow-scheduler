@@ -677,4 +677,21 @@ def IndirectAccessLoopMaterializationPass
   ];
 }
 
+def LoopReorderingPass : Pass<"loop-reordering", "mlir::ModuleOp"> {
+  let summary = "Identify interchange-candidate loop sets for reordering";
+  let description = [{
+    Walks all scf.for loop nests and identifies groups of loops that can be
+    freely reordered with respect to each other, by classifying the ops that
+    appear between adjacent loop headers as hoistable, sinkable, or true
+    barriers. Adjacent loops with no true barrier between them are candidates
+    for interchange, and candidacy is extended transitively.
+
+    Currently the pass only prints the candidate sets and makes no IR changes.
+  }];
+  let constructor = "::scheduler::createLoopReorderingPass()";
+  let dependentDialects = [
+    "mlir::scf::SCFDialect"
+  ];
+}
+
 #endif // DATAFLOW_SCHEDULER_TRANSFORMS_PASSES_TD
