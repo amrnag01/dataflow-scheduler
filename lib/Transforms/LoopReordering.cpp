@@ -18,26 +18,20 @@
 //
 // Pass: -loop-reordering
 //
-// Identifies groups of scf.for loops that are candidates for interchange.
-// Two adjacent loops are candidates if there is no "true barrier" op between
-// them — i.e. every op interleaved between the two loop headers is either
-// hoistable (all operands defined outside the outer loop) or sinkable (result
-// only used inside the inner loop body). Candidacy is extended transitively to
-// form maximal interchange-candidate sets.
-//
-// Currently this pass only prints the candidate sets and makes no IR changes.
+// Identifies groups of scf.for loops that are candidates for interchange,
+// clears the interleaved ops between them (hoisting or sinking as appropriate),
+// and returns the resulting perfectly-nested candidate sets.
 //
 //===----------------------------------------------------------------------===//
 
 #include "dataflow-scheduler/Transforms/Passes.h"
+#include "dataflow-scheduler/Transforms/Utils/Hoisting.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -55,48 +49,26 @@ namespace {
 
 /// Classification of a single interleaved op.
 enum class OpClass {
-  Hoistable,          ///< must be moved above the outer loop
-  Sinkable,           ///< must be moved into the inner loop body
-  HoistableAndSinkable, ///< no consumers/producers in S constrain it yet;
-                        ///  defaults to Sinkable at move time
-  Barrier,            ///< true barrier — cannot be moved
+  Hoistable,            ///< must be moved above the outer loop
+  Sinkable,             ///< must be moved into the inner loop body
+  HoistableAndSinkable, ///< unconstrained; defaults to Sinkable
+  Barrier,              ///< true barrier — cannot be moved
 };
 
 static StringRef opClassName(OpClass cls) {
   switch (cls) {
-    case OpClass::Hoistable:           return "hoistable";
-    case OpClass::Sinkable:            return "sinkable";
+    case OpClass::Hoistable:            return "hoistable";
+    case OpClass::Sinkable:             return "sinkable";
     case OpClass::HoistableAndSinkable: return "hoistable+sinkable";
-    case OpClass::Barrier:             return "TRUE BARRIER";
+    case OpClass::Barrier:              return "TRUE BARRIER";
   }
   return "unknown";
 }
 
 /// Classify all ops between `outerLoop` and `innerLoop` in a single top-down
-/// pass.
-///
-/// Initial classification per op:
-///   Hoistable           — all operands outside outer loop or from a
-///                         hoistable/HoistableAndSinkable op in S; AND result
-///                         escapes into the outer loop body (not sink-eligible)
-///   Sinkable            — all results consumed only inside the inner loop,
-///                         the inner loop op itself, or a later op in S; AND
-///                         at least one operand is the outer IV or comes from a
-///                         sinkable/HoistableAndSinkable op in S (can't hoist)
-///   HoistableAndSinkable — satisfies both independently; direction deferred
-///   Barrier             — neither
-///
-/// Demotion pass (immediate, inline):
-///   After classifying an op, if it is Hoistable-only, walk its operands in S
-///   and demote any HoistableAndSinkable operand to Hoistable (because this
-///   consumer cannot be sunk to meet it).
-///   If it is Sinkable-only, walk its operands in S and demote any
-///   HoistableAndSinkable operand to Sinkable (because this consumer cannot
-///   be hoisted above it).
-///   Remaining HoistableAndSinkable at the end default to Sinkable.
+/// pass with immediate demotion of HoistableAndSinkable producers.
 static llvm::DenseMap<Operation*, OpClass> classifyInterleavedOps(
     scf::ForOp outerLoop, scf::ForOp innerLoop) {
-  // Collect interleaved ops in order (top-down).
   SmallVector<Operation*> ops;
   for (Operation& op : *outerLoop.getBody()) {
     if (&op == innerLoop.getOperation()) break;
@@ -110,34 +82,26 @@ static llvm::DenseMap<Operation*, OpClass> classifyInterleavedOps(
 
   llvm::DenseMap<Operation*, OpClass> cls;
 
-  // Helper: returns true if `val` is defined inside `outerBody`.
   auto definedInOuter = [&](Value val) -> bool {
     if (auto blockArg = dyn_cast<BlockArgument>(val))
       return blockArg.getParentRegion() == &outerBody;
     return outerBody.isAncestor(val.getDefiningOp()->getParentRegion());
   };
 
-  // Helper: demote a HoistableAndSinkable operand in S to `target`.
-  // Called when we discover a constraint from a consumer op.
   auto demoteOperandsInS = [&](Operation* op, OpClass target) {
     for (Value operand : op->getOperands()) {
       if (dyn_cast<BlockArgument>(operand)) continue;
       Operation* defOp = operand.getDefiningOp();
-      if (opSet.count(defOp) &&
-          cls[defOp] == OpClass::HoistableAndSinkable)
+      if (opSet.count(defOp) && cls[defOp] == OpClass::HoistableAndSinkable)
         cls[defOp] = target;
     }
   };
 
-  // Single top-down pass.
   for (Operation* op : ops) {
-    // --- Hoistable check ---
-    // All operands must be outside the outer loop, or from a
-    // Hoistable/HoistableAndSinkable op in S.
+    // Hoistable: all operands outside outer loop or from Hoistable/Both in S.
     bool hoistable = true;
     for (Value operand : op->getOperands()) {
       if (!definedInOuter(operand)) continue;
-      // Defined inside outer loop — must be a hoistable op in S.
       Operation* defOp = operand.getDefiningOp();
       if (!opSet.count(defOp) ||
           (cls[defOp] != OpClass::Hoistable &&
@@ -147,25 +111,21 @@ static llvm::DenseMap<Operation*, OpClass> classifyInterleavedOps(
       }
     }
 
-    // --- Sinkable check ---
-    // (1) All results consumed only inside the inner loop body or by a later
-    //     op in S. Using a result as a bound/step of the inner loop itself
-    //     does NOT qualify — the bound is evaluated before the body runs, so
-    //     the op must already be defined above the inner loop at that point,
-    //     making it hoistable, not sinkable.
+    // Sinkable check (1): results only consumed inside inner body or later in S.
+    // Note: use as a loop bound/step does NOT qualify — bounds are evaluated
+    // before the body, so such ops must be hoistable, not sinkable.
     bool sinkable = true;
     for (Value result : op->getResults()) {
       for (OpOperand& use : result.getUses()) {
         Operation* user = use.getOwner();
         if (innerBody.isAncestor(user->getParentRegion())) continue;
-        if (opSet.count(user)) continue;  // later op in S
+        if (opSet.count(user)) continue;
         sinkable = false;
         break;
       }
       if (!sinkable) break;
     }
-    // (2) All operands that are inside the outer loop must come from a
-    //     Sinkable/HoistableAndSinkable op in S (chain can travel down).
+    // Sinkable check (2): inner-loop-defined operands from Sinkable/Both in S.
     if (sinkable) {
       for (Value operand : op->getOperands()) {
         if (!definedInOuter(operand)) continue;
@@ -180,7 +140,6 @@ static llvm::DenseMap<Operation*, OpClass> classifyInterleavedOps(
       }
     }
 
-    // Assign initial class.
     OpClass c;
     if (hoistable && sinkable)  c = OpClass::HoistableAndSinkable;
     else if (hoistable)         c = OpClass::Hoistable;
@@ -188,15 +147,13 @@ static llvm::DenseMap<Operation*, OpClass> classifyInterleavedOps(
     else                        c = OpClass::Barrier;
     cls[op] = c;
 
-    // Immediate demotion: constrain already-classified operands in S.
     if (c == OpClass::Hoistable)
       demoteOperandsInS(op, OpClass::Hoistable);
     else if (c == OpClass::Sinkable)
       demoteOperandsInS(op, OpClass::Sinkable);
-    // Barrier: operands are irrelevant — the pair is already rejected.
   }
 
-  // Any remaining HoistableAndSinkable defaults to Sinkable.
+  // Remaining HoistableAndSinkable defaults to Sinkable.
   for (Operation* op : ops)
     if (cls[op] == OpClass::HoistableAndSinkable)
       cls[op] = OpClass::Sinkable;
@@ -204,45 +161,97 @@ static llvm::DenseMap<Operation*, OpClass> classifyInterleavedOps(
   return cls;
 }
 
-/// Returns true if there is no barrier op between `outerLoop` and `innerLoop`
-/// (i.e. the pair is interchange-candidate).
-static bool areCandidates(scf::ForOp outerLoop, scf::ForOp innerLoop) {
+/// Checks if (outerLoop, innerLoop) are interchange-candidates.
+/// If so: prints the interleaved ops with their classifications (to errs),
+/// then moves them (hoistable above outerLoop, sinkable into innerLoop body).
+/// Returns true if the pair is a candidate; false if a barrier was found.
+static bool clearAndCheckCandidates(scf::ForOp outerLoop,
+                                    scf::ForOp innerLoop) {
   auto cls = classifyInterleavedOps(outerLoop, innerLoop);
   for (auto& [op, c] : cls)
     if (c == OpClass::Barrier) return false;
+
+  // Collect ops in original top-down order.
+  SmallVector<Operation*> ops;
+  for (Operation& op : *outerLoop.getBody()) {
+    if (&op == innerLoop.getOperation()) break;
+    if (op.hasTrait<OpTrait::IsTerminator>()) continue;
+    ops.push_back(&op);
+  }
+
+  // Print before moving.
+  if (!ops.empty()) {
+    llvm::errs() << "        interleaved ops (outer iv=";
+    outerLoop.getInductionVar().printAsOperand(llvm::errs(), OpPrintingFlags());
+    llvm::errs() << " → inner iv=";
+    innerLoop.getInductionVar().printAsOperand(llvm::errs(), OpPrintingFlags());
+    llvm::errs() << "):\n";
+    for (Operation* op : ops) {
+      llvm::errs() << "          [" << opClassName(cls[op]) << "]  ";
+      op->print(llvm::errs(), OpPrintingFlags().useLocalScope());
+      llvm::errs() << "\n";
+    }
+  }
+
+  // Move hoistable ops as high as SSA allows.
+  for (Operation* op : ops) {
+    if (cls[op] != OpClass::Hoistable) continue;
+    Operation* target = scheduler::findHoistingTarget(
+        op, [](mlir::Region* r) { return isa<scf::ForOp>(r->getParentOp()); });
+    if (target)
+      op->moveBefore(target);
+  }
+
+  // Move sinkable ops into innerLoop body (reverse to preserve order).
+  Block* innerBody = innerLoop.getBody();
+  for (Operation* op : llvm::reverse(ops))
+    if (cls[op] == OpClass::Sinkable)
+      op->moveBefore(innerBody, innerBody->begin());
+
   return true;
 }
 
-/// Returns the unique directly-nested scf.ForOp inside `loop`, if there is
-/// exactly one and it appears as the *only* structural op in the body (all
-/// other ops are either hoistable or sinkable w.r.t. that pair).  Returns
-/// nullptr if there is no directly nested loop, or if there are multiple.
+/// Returns the unique directly-nested scf.ForOp inside `loop`, or nullptr.
 static scf::ForOp getUniqueInnerLoop(scf::ForOp loop) {
   scf::ForOp inner;
   for (Operation& op : *loop.getBody()) {
     if (auto candidate = dyn_cast<scf::ForOp>(&op)) {
-      if (inner)
-        return {};  // more than one inner loop — don't treat as a nest
+      if (inner) return {};
       inner = candidate;
     }
   }
   return inner;
 }
 
-/// Walk the IR and find all maximal interchange-candidate loop sets.
-///
-/// Algorithm:
-///   1. Find all top-level scf.for loops (not nested inside another scf.for).
-///   2. For each top-level loop, descend the nesting chain.  At each level,
-///      check whether the current loop and its unique inner loop are candidates.
-///   3. Extend the current candidate set transitively as long as the pair
-///      passes the areCandidates() check.
-///   4. Emit any set with >= 2 members.
+static void printLoopSummary(scf::ForOp loop, unsigned depth,
+                              llvm::raw_ostream& os) {
+  os << "  [depth " << depth << "]  scf.for ";
+  loop.getInductionVar().printAsOperand(os, OpPrintingFlags());
+  os << " = ";
+  loop.getLowerBound().printAsOperand(os, OpPrintingFlags());
+  os << " to ";
+  loop.getUpperBound().printAsOperand(os, OpPrintingFlags());
+  os << " step ";
+  loop.getStep().printAsOperand(os, OpPrintingFlags());
+  os << "\n";
+}
+
+static void printCandidateSet(unsigned idx, ArrayRef<scf::ForOp> set,
+                               llvm::raw_ostream& os) {
+  os << "\n┌─ Candidate Set " << idx << " (" << set.size() << " loops) ";
+  os << "─────────────────────────────────\n";
+  unsigned baseDepth = 0;
+  for (Operation* p = set[0]->getParentOp(); p; p = p->getParentOp())
+    if (isa<scf::ForOp>(p)) ++baseDepth;
+  for (unsigned i = 0; i < set.size(); ++i)
+    printLoopSummary(set[i], baseDepth + i, os);
+  os << "└─────────────────────────────────────────────────────────────\n";
+}
+
 static void findCandidateSets(
     Operation* root,
     SmallVectorImpl<SmallVector<scf::ForOp>>& result) {
 
-  // Collect all scf.for ops whose immediate parent is NOT another scf.for.
   SmallVector<scf::ForOp> topLevel;
   root->walk([&](scf::ForOp loop) {
     if (!isa<scf::ForOp>(loop->getParentOp()))
@@ -254,20 +263,16 @@ static void findCandidateSets(
     scf::ForOp cur = startLoop;
 
     while (cur) {
-      if (currentSet.empty()) {
+      if (currentSet.empty())
         currentSet.push_back(cur);
-      }
 
       scf::ForOp inner = getUniqueInnerLoop(cur);
-      if (!inner)
-        break;
+      if (!inner) break;
 
-      if (areCandidates(cur, inner)) {
+      if (clearAndCheckCandidates(cur, inner)) {
         currentSet.push_back(inner);
         cur = inner;
       } else {
-        // True barrier found — flush the current set if it has >= 2 loops,
-        // then start a new set beginning with the inner loop.
         if (currentSet.size() >= 2)
           result.push_back(currentSet);
         currentSet.clear();
@@ -282,67 +287,6 @@ static void findCandidateSets(
 }
 
 // ---------------------------------------------------------------------------
-// Pretty-printing helpers
-// ---------------------------------------------------------------------------
-
-/// Print one scf.for loop's summary line, e.g.:
-///   [depth 2]  scf.for %arg1 = %c0 to %7 step %c1
-static void printLoopSummary(scf::ForOp loop, unsigned depth,
-                              llvm::raw_ostream& os) {
-  os << "  [depth " << depth << "]  scf.for ";
-  loop.getInductionVar().printAsOperand(os, OpPrintingFlags());
-  os << " = ";
-  loop.getLowerBound().printAsOperand(os, OpPrintingFlags());
-  os << " to ";
-  loop.getUpperBound().printAsOperand(os, OpPrintingFlags());
-  os << " step ";
-  loop.getStep().printAsOperand(os, OpPrintingFlags());
-  os << "\n";
-}
-
-/// Print the interleaved ops between outerLoop and innerLoop with their
-/// classifications (hoistable / sinkable / true barrier).
-static void printInterleavedOps(scf::ForOp outerLoop, scf::ForOp innerLoop,
-                                 llvm::raw_ostream& os) {
-  auto cls = classifyInterleavedOps(outerLoop, innerLoop);
-  if (cls.empty()) {
-    os << "          (no interleaved ops — perfectly nested)\n";
-    return;
-  }
-  // Print in original order.
-  for (Operation& op : *outerLoop.getBody()) {
-    if (&op == innerLoop.getOperation()) break;
-    if (op.hasTrait<OpTrait::IsTerminator>()) continue;
-    os << "          [" << opClassName(cls[&op]) << "]  ";
-    op.print(os, OpPrintingFlags().useLocalScope());
-    os << "\n";
-  }
-}
-
-/// Pretty-print a single interchange-candidate set.
-static void printCandidateSet(unsigned idx,
-                               ArrayRef<scf::ForOp> set,
-                               llvm::raw_ostream& os) {
-  os << "\n┌─ Candidate Set " << idx << " (" << set.size() << " loops) ";
-  os << "─────────────────────────────────\n";
-
-  // Compute depth of the first loop in the set relative to any scf.for parent.
-  unsigned baseDepth = 0;
-  for (Operation* p = set[0]->getParentOp(); p; p = p->getParentOp())
-    if (isa<scf::ForOp>(p)) ++baseDepth;
-
-  for (unsigned i = 0; i < set.size(); ++i) {
-    printLoopSummary(set[i], baseDepth + i, os);
-    if (i + 1 < set.size()) {
-      os << "        interleaved ops between loop " << i << " and loop "
-         << (i + 1) << ":\n";
-      printInterleavedOps(set[i], set[i + 1], os);
-    }
-  }
-  os << "└─────────────────────────────────────────────────────────────\n";
-}
-
-// ---------------------------------------------------------------------------
 
 struct LoopReorderingPass
     : public scheduler::impl::LoopReorderingPassBase<LoopReorderingPass> {
@@ -352,36 +296,32 @@ struct LoopReorderingPass
     Operation* module = getOperation();
 
     SmallVector<SmallVector<scf::ForOp>> candidateSets;
+
+    llvm::errs() << "[LoopReordering] Analysing interleaved ops:\n";
     findCandidateSets(module, candidateSets);
 
     if (candidateSets.empty()) {
-      llvm::outs() << "[LoopReordering] No interchange-candidate loop sets "
+      llvm::errs() << "[LoopReordering] No interchange-candidate loop sets "
                       "found.\n";
       return;
     }
 
-    llvm::outs() << "[LoopReordering] Found " << candidateSets.size()
+    llvm::errs() << "[LoopReordering] Found " << candidateSets.size()
                  << " interchange-candidate loop set(s):";
     for (auto [idx, set] : llvm::enumerate(candidateSets))
-      printCandidateSet(static_cast<unsigned>(idx), set, llvm::outs());
-    llvm::outs() << "\n";
+      printCandidateSet(static_cast<unsigned>(idx), set, llvm::errs());
+    llvm::errs() << "\n";
 
-    // Dump the IR of each unique enclosing function so the reader can see the
-    // full context of every candidate set.
     LLVM_DEBUG({
-      // Collect unique enclosing func::FuncOp for all sets.
       llvm::SmallPtrSet<Operation*, 4> printed;
       for (auto& set : candidateSets) {
-        // Walk up from the first loop in the set to find its enclosing FuncOp.
         Operation* parent = set[0]->getParentOp();
         while (parent && !isa<func::FuncOp>(parent))
           parent = parent->getParentOp();
         if (!parent || !printed.insert(parent).second) continue;
-
-        llvm::dbgs() << "\n[LoopReordering] IR of enclosing function after "
-                        "candidate analysis:\n";
-        llvm::dbgs() << "// func: ";
-        llvm::dbgs() << cast<func::FuncOp>(parent).getName() << "\n";
+        llvm::dbgs() << "\n[LoopReordering] IR after movement:\n";
+        llvm::dbgs() << "// func: "
+                     << cast<func::FuncOp>(parent).getName() << "\n";
         parent->print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
         llvm::dbgs() << "\n";
       }
