@@ -26,17 +26,15 @@
 
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Transforms/Utils/Hoisting.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
 #define PASS_NAME "loop-reordering"
-#define DEBUG_TYPE PASS_NAME
+#define DEBUG_LOOPORDER
 
 using namespace mlir;
 
@@ -161,12 +159,20 @@ static llvm::DenseMap<Operation*, OpClass> classifyInterleavedOps(
   return cls;
 }
 
+/// Per-pair interleaved op info: op text + classification, captured before
+/// moving (moving invalidates SSA names).
+struct InterleavedOpInfo {
+  std::string text;
+  OpClass cls;
+};
+
 /// Checks if (outerLoop, innerLoop) are interchange-candidates.
-/// If so: prints the interleaved ops with their classifications (to errs),
-/// then moves them (hoistable above outerLoop, sinkable into innerLoop body).
+/// If so: captures interleaved op info into `opsOut`, then moves the ops
+/// (hoistable above outerLoop, sinkable into innerLoop body).
 /// Returns true if the pair is a candidate; false if a barrier was found.
-static bool clearAndCheckCandidates(scf::ForOp outerLoop,
-                                    scf::ForOp innerLoop) {
+static bool clearAndCheckCandidates(
+    scf::ForOp outerLoop, scf::ForOp innerLoop,
+    SmallVectorImpl<InterleavedOpInfo>& opsOut) {
   auto cls = classifyInterleavedOps(outerLoop, innerLoop);
   for (auto& [op, c] : cls)
     if (c == OpClass::Barrier) return false;
@@ -179,18 +185,12 @@ static bool clearAndCheckCandidates(scf::ForOp outerLoop,
     ops.push_back(&op);
   }
 
-  // Print before moving.
-  if (!ops.empty()) {
-    llvm::errs() << "        interleaved ops (outer iv=";
-    outerLoop.getInductionVar().printAsOperand(llvm::errs(), OpPrintingFlags());
-    llvm::errs() << " → inner iv=";
-    innerLoop.getInductionVar().printAsOperand(llvm::errs(), OpPrintingFlags());
-    llvm::errs() << "):\n";
-    for (Operation* op : ops) {
-      llvm::errs() << "          [" << opClassName(cls[op]) << "]  ";
-      op->print(llvm::errs(), OpPrintingFlags().useLocalScope());
-      llvm::errs() << "\n";
-    }
+  // Capture op text + classification before moving (names change after move).
+  for (Operation* op : ops) {
+    std::string buf;
+    llvm::raw_string_ostream ss(buf);
+    op->print(ss, OpPrintingFlags().useLocalScope());
+    opsOut.push_back({std::move(buf), cls[op]});
   }
 
   // Move hoistable ops as high as SSA allows.
@@ -236,22 +236,34 @@ static void printLoopSummary(scf::ForOp loop, unsigned depth,
   os << "\n";
 }
 
-static void printCandidateSet(unsigned idx, ArrayRef<scf::ForOp> set,
-                               llvm::raw_ostream& os) {
+/// pairOps[i] holds the interleaved ops between set[i] and set[i+1].
+static void printCandidateSet(
+    unsigned idx, ArrayRef<scf::ForOp> set,
+    ArrayRef<SmallVector<InterleavedOpInfo>> pairOps,
+    llvm::raw_ostream& os) {
   os << "\n┌─ Candidate Set " << idx << " (" << set.size() << " loops) ";
   os << "─────────────────────────────────\n";
   unsigned baseDepth = 0;
   for (Operation* p = set[0]->getParentOp(); p; p = p->getParentOp())
     if (isa<scf::ForOp>(p)) ++baseDepth;
-  for (unsigned i = 0; i < set.size(); ++i)
+  for (unsigned i = 0; i < set.size(); ++i) {
     printLoopSummary(set[i], baseDepth + i, os);
+    if (i + 1 < set.size() && !pairOps[i].empty()) {
+      for (auto& info : pairOps[i]) {
+        os << "      [" << opClassName(info.cls) << "]  " << info.text << "\n";
+      }
+    }
+  }
   os << "└─────────────────────────────────────────────────────────────\n";
 }
 
-static void findCandidateSets(
-    Operation* root,
-    SmallVectorImpl<SmallVector<scf::ForOp>>& result) {
+struct CandidateSetInfo {
+  SmallVector<scf::ForOp> loops;
+  SmallVector<SmallVector<InterleavedOpInfo>> pairOps; ///< pairOps[i]: between loops[i] and loops[i+1]
+};
 
+static void findCandidateSets(Operation* root,
+                               SmallVectorImpl<CandidateSetInfo>& result) {
   SmallVector<scf::ForOp> topLevel;
   root->walk([&](scf::ForOp loop) {
     if (!isa<scf::ForOp>(loop->getParentOp()))
@@ -259,30 +271,32 @@ static void findCandidateSets(
   });
 
   for (scf::ForOp startLoop : topLevel) {
-    SmallVector<scf::ForOp> currentSet;
+    CandidateSetInfo current;
     scf::ForOp cur = startLoop;
 
     while (cur) {
-      if (currentSet.empty())
-        currentSet.push_back(cur);
+      if (current.loops.empty())
+        current.loops.push_back(cur);
 
       scf::ForOp inner = getUniqueInnerLoop(cur);
       if (!inner) break;
 
-      if (clearAndCheckCandidates(cur, inner)) {
-        currentSet.push_back(inner);
+      SmallVector<InterleavedOpInfo> pairInfo;
+      if (clearAndCheckCandidates(cur, inner, pairInfo)) {
+        current.loops.push_back(inner);
+        current.pairOps.push_back(std::move(pairInfo));
         cur = inner;
       } else {
-        if (currentSet.size() >= 2)
-          result.push_back(currentSet);
-        currentSet.clear();
-        currentSet.push_back(inner);
+        if (current.loops.size() >= 2)
+          result.push_back(std::move(current));
+        current = {};
+        current.loops.push_back(inner);
         cur = inner;
       }
     }
 
-    if (currentSet.size() >= 2)
-      result.push_back(currentSet);
+    if (current.loops.size() >= 2)
+      result.push_back(std::move(current));
   }
 }
 
@@ -295,37 +309,24 @@ struct LoopReorderingPass
   void runOnOperation() override {
     Operation* module = getOperation();
 
-    SmallVector<SmallVector<scf::ForOp>> candidateSets;
+    SmallVector<CandidateSetInfo> candidateSets;
 
-    llvm::errs() << "[LoopReordering] Analysing interleaved ops:\n";
     findCandidateSets(module, candidateSets);
 
+#ifdef DEBUG_LOOPORDER
     if (candidateSets.empty()) {
-      llvm::errs() << "[LoopReordering] No interchange-candidate loop sets "
+      llvm::outs() << "[LoopReordering] No interchange-candidate loop sets "
                       "found.\n";
       return;
     }
 
-    llvm::errs() << "[LoopReordering] Found " << candidateSets.size()
+    llvm::outs() << "[LoopReordering] Found " << candidateSets.size()
                  << " interchange-candidate loop set(s):";
-    for (auto [idx, set] : llvm::enumerate(candidateSets))
-      printCandidateSet(static_cast<unsigned>(idx), set, llvm::errs());
-    llvm::errs() << "\n";
-
-    LLVM_DEBUG({
-      llvm::SmallPtrSet<Operation*, 4> printed;
-      for (auto& set : candidateSets) {
-        Operation* parent = set[0]->getParentOp();
-        while (parent && !isa<func::FuncOp>(parent))
-          parent = parent->getParentOp();
-        if (!parent || !printed.insert(parent).second) continue;
-        llvm::dbgs() << "\n[LoopReordering] IR after movement:\n";
-        llvm::dbgs() << "// func: "
-                     << cast<func::FuncOp>(parent).getName() << "\n";
-        parent->print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
-        llvm::dbgs() << "\n";
-      }
-    });
+    for (auto [idx, info] : llvm::enumerate(candidateSets))
+      printCandidateSet(static_cast<unsigned>(idx), info.loops, info.pairOps,
+                        llvm::outs());
+    llvm::outs() << "\n";
+#endif
   }
 };
 
