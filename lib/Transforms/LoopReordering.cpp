@@ -54,33 +54,49 @@ namespace scheduler {
 namespace {
 
 /// Classification of a single interleaved op.
-/// An op may be both Hoistable and Sinkable simultaneously.
-struct OpClass {
-  bool hoistable = false;
-  bool sinkable  = false;
-  bool isTrueBarrier() const { return !hoistable && !sinkable; }
+enum class OpClass {
+  Hoistable,          ///< must be moved above the outer loop
+  Sinkable,           ///< must be moved into the inner loop body
+  HoistableAndSinkable, ///< no consumers/producers in S constrain it yet;
+                        ///  defaults to Sinkable at move time
+  Barrier,            ///< true barrier — cannot be moved
 };
 
-static std::string opClassName(OpClass cls) {
-  if (cls.hoistable && cls.sinkable) return "hoistable+sinkable";
-  if (cls.hoistable) return "hoistable";
-  if (cls.sinkable)  return "sinkable";
-  return "TRUE BARRIER";
+static StringRef opClassName(OpClass cls) {
+  switch (cls) {
+    case OpClass::Hoistable:           return "hoistable";
+    case OpClass::Sinkable:            return "sinkable";
+    case OpClass::HoistableAndSinkable: return "hoistable+sinkable";
+    case OpClass::Barrier:             return "TRUE BARRIER";
+  }
+  return "unknown";
 }
 
 /// Classify all ops between `outerLoop` and `innerLoop` in a single top-down
-/// pass. An op can be both hoistable and sinkable.
+/// pass.
 ///
-/// Hoistable: all operands are defined outside the outer loop, or produced by
-///   a prior op in S that is hoistable.
+/// Initial classification per op:
+///   Hoistable           — all operands outside outer loop or from a
+///                         hoistable/HoistableAndSinkable op in S; AND result
+///                         escapes into the outer loop body (not sink-eligible)
+///   Sinkable            — all results consumed only inside the inner loop,
+///                         the inner loop op itself, or a later op in S; AND
+///                         at least one operand is the outer IV or comes from a
+///                         sinkable/HoistableAndSinkable op in S (can't hoist)
+///   HoistableAndSinkable — satisfies both independently; direction deferred
+///   Barrier             — neither
 ///
-/// Sinkable: all results are used only inside the inner loop body, on the
-///   inner loop op itself, or by a later op in S — AND all operands are either
-///   outside the outer loop, produced by a hoistable op in S, or produced by
-///   a sinkable op in S (so the whole chain can move down together).
+/// Demotion pass (immediate, inline):
+///   After classifying an op, if it is Hoistable-only, walk its operands in S
+///   and demote any HoistableAndSinkable operand to Hoistable (because this
+///   consumer cannot be sunk to meet it).
+///   If it is Sinkable-only, walk its operands in S and demote any
+///   HoistableAndSinkable operand to Sinkable (because this consumer cannot
+///   be hoisted above it).
+///   Remaining HoistableAndSinkable at the end default to Sinkable.
 static llvm::DenseMap<Operation*, OpClass> classifyInterleavedOps(
     scf::ForOp outerLoop, scf::ForOp innerLoop) {
-  // Collect interleaved ops in order.
+  // Collect interleaved ops in order (top-down).
   SmallVector<Operation*> ops;
   for (Operation& op : *outerLoop.getBody()) {
     if (&op == innerLoop.getOperation()) break;
@@ -94,85 +110,106 @@ static llvm::DenseMap<Operation*, OpClass> classifyInterleavedOps(
 
   llvm::DenseMap<Operation*, OpClass> cls;
 
+  // Helper: returns true if `val` is defined inside `outerBody`.
+  auto definedInOuter = [&](Value val) -> bool {
+    if (auto blockArg = dyn_cast<BlockArgument>(val))
+      return blockArg.getParentRegion() == &outerBody;
+    return outerBody.isAncestor(val.getDefiningOp()->getParentRegion());
+  };
+
+  // Helper: demote a HoistableAndSinkable operand in S to `target`.
+  // Called when we discover a constraint from a consumer op.
+  auto demoteOperandsInS = [&](Operation* op, OpClass target) {
+    for (Value operand : op->getOperands()) {
+      if (dyn_cast<BlockArgument>(operand)) continue;
+      Operation* defOp = operand.getDefiningOp();
+      if (opSet.count(defOp) &&
+          cls[defOp] == OpClass::HoistableAndSinkable)
+        cls[defOp] = target;
+    }
+  };
+
   // Single top-down pass.
   for (Operation* op : ops) {
-    OpClass c;
-
     // --- Hoistable check ---
-    // All operands must be outside the outer loop or from a hoistable op in S.
-    c.hoistable = true;
+    // All operands must be outside the outer loop, or from a
+    // Hoistable/HoistableAndSinkable op in S.
+    bool hoistable = true;
     for (Value operand : op->getOperands()) {
-      if (auto blockArg = dyn_cast<BlockArgument>(operand)) {
-        if (blockArg.getParentRegion() == &outerBody) {
-          c.hoistable = false;
-          break;
-        }
-      } else {
-        Operation* defOp = operand.getDefiningOp();
-        if (outerBody.isAncestor(defOp->getParentRegion())) {
-          // Defined inside the outer loop — only ok if it's a hoistable op in S.
-          if (!opSet.count(defOp) || !cls[defOp].hoistable) {
-            c.hoistable = false;
-            break;
-          }
-        }
+      if (!definedInOuter(operand)) continue;
+      // Defined inside outer loop — must be a hoistable op in S.
+      Operation* defOp = operand.getDefiningOp();
+      if (!opSet.count(defOp) ||
+          (cls[defOp] != OpClass::Hoistable &&
+           cls[defOp] != OpClass::HoistableAndSinkable)) {
+        hoistable = false;
+        break;
       }
     }
 
     // --- Sinkable check ---
-    // (1) All results only consumed inside inner loop body, by inner loop
-    //     itself, or by a later op in S.
-    // (2) All operands are outside the outer loop, from a hoistable op in S,
-    //     or from a sinkable op in S (so the chain can travel down together).
-    c.sinkable = true;
-
-    // Check (1): result uses.
+    // (1) All results consumed only inside the inner loop body or by a later
+    //     op in S. Using a result as a bound/step of the inner loop itself
+    //     does NOT qualify — the bound is evaluated before the body runs, so
+    //     the op must already be defined above the inner loop at that point,
+    //     making it hoistable, not sinkable.
+    bool sinkable = true;
     for (Value result : op->getResults()) {
       for (OpOperand& use : result.getUses()) {
         Operation* user = use.getOwner();
-        if (user == innerLoop.getOperation()) continue;
         if (innerBody.isAncestor(user->getParentRegion())) continue;
-        if (opSet.count(user)) continue;  // later op in S — ok
-        c.sinkable = false;
+        if (opSet.count(user)) continue;  // later op in S
+        sinkable = false;
         break;
       }
-      if (!c.sinkable) break;
+      if (!sinkable) break;
     }
-
-    // Check (2): operand provenance (only if (1) passed).
-    if (c.sinkable) {
+    // (2) All operands that are inside the outer loop must come from a
+    //     Sinkable/HoistableAndSinkable op in S (chain can travel down).
+    if (sinkable) {
       for (Value operand : op->getOperands()) {
-        if (auto blockArg = dyn_cast<BlockArgument>(operand)) {
-          if (blockArg.getParentRegion() == &outerBody) {
-            // Outer IV or iter-arg — fine, the sink will carry it along.
-            continue;
-          }
-        } else {
-          Operation* defOp = operand.getDefiningOp();
-          if (outerBody.isAncestor(defOp->getParentRegion())) {
-            // Defined inside outer loop: must be hoistable or sinkable in S.
-            if (!opSet.count(defOp) ||
-                (!cls[defOp].hoistable && !cls[defOp].sinkable)) {
-              c.sinkable = false;
-              break;
-            }
-          }
+        if (!definedInOuter(operand)) continue;
+        if (dyn_cast<BlockArgument>(operand)) continue;  // outer IV — ok
+        Operation* defOp = operand.getDefiningOp();
+        if (!opSet.count(defOp) ||
+            (cls[defOp] != OpClass::Sinkable &&
+             cls[defOp] != OpClass::HoistableAndSinkable)) {
+          sinkable = false;
+          break;
         }
       }
     }
 
+    // Assign initial class.
+    OpClass c;
+    if (hoistable && sinkable)  c = OpClass::HoistableAndSinkable;
+    else if (hoistable)         c = OpClass::Hoistable;
+    else if (sinkable)          c = OpClass::Sinkable;
+    else                        c = OpClass::Barrier;
     cls[op] = c;
+
+    // Immediate demotion: constrain already-classified operands in S.
+    if (c == OpClass::Hoistable)
+      demoteOperandsInS(op, OpClass::Hoistable);
+    else if (c == OpClass::Sinkable)
+      demoteOperandsInS(op, OpClass::Sinkable);
+    // Barrier: operands are irrelevant — the pair is already rejected.
   }
+
+  // Any remaining HoistableAndSinkable defaults to Sinkable.
+  for (Operation* op : ops)
+    if (cls[op] == OpClass::HoistableAndSinkable)
+      cls[op] = OpClass::Sinkable;
 
   return cls;
 }
 
-/// Returns true if there is no true-barrier op between `outerLoop` and
-/// `innerLoop` (i.e. the pair is interchange-candidate).
+/// Returns true if there is no barrier op between `outerLoop` and `innerLoop`
+/// (i.e. the pair is interchange-candidate).
 static bool areCandidates(scf::ForOp outerLoop, scf::ForOp innerLoop) {
   auto cls = classifyInterleavedOps(outerLoop, innerLoop);
   for (auto& [op, c] : cls)
-    if (c.isTrueBarrier()) return false;
+    if (c == OpClass::Barrier) return false;
   return true;
 }
 
