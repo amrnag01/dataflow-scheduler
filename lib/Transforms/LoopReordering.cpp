@@ -302,6 +302,75 @@ static void findCandidateSets(Operation* root,
 
 // ---------------------------------------------------------------------------
 
+/// Interchange two perfectly-nested adjacent scf.for loops.
+/// forOpA must be the outer loop and forOpB must be the unique loop
+/// directly nested inside forOpA's body (same invariant as affine::interchangeLoops).
+static void interchangeLoops(scf::ForOp forOpA, scf::ForOp forOpB) {
+  assert(&*forOpA.getBody()->begin() == forOpB.getOperation());
+  auto& forOpABody = forOpA.getBody()->getOperations();
+  auto& forOpBBody = forOpB.getBody()->getOperations();
+
+  // 1) Splice forOpB out of forOpA's body to just before forOpA in the parent
+  //    block. forOpA's body now contains only its terminator.
+  forOpA->getBlock()->getOperations().splice(
+      Block::iterator(forOpA), forOpABody,
+      forOpABody.begin(), std::prev(forOpABody.end()));
+
+  // 2) Splice the original forOpA body contents (now forOpB's former body,
+  //    i.e. the real loop body) into the beginning of forOpA's empty body.
+  forOpABody.splice(forOpABody.begin(), forOpBBody,
+                    forOpBBody.begin(), std::prev(forOpBBody.end()));
+
+  // 3) Splice forOpA into the beginning of forOpB's body so forOpB wraps forOpA.
+  forOpBBody.splice(forOpBBody.begin(),
+                    forOpA->getBlock()->getOperations(),
+                    Block::iterator(forOpA));
+}
+
+/// Reorder the loops in `loops` (a perfectly-nested candidate set) according
+/// to `permutation`, where permutation[i] is the index in the original `loops`
+/// array that should become position i after reordering.
+///
+/// Example: loops = {A, B, C}, permutation = {2, 0, 1}
+///   → new nesting order: C (outer), A, B (inner)
+///
+/// The permutation is decomposed into adjacent transpositions (bubble-sort)
+/// and each is applied via interchangeLoops().
+[[maybe_unused]] static void reorderLoops(ArrayRef<scf::ForOp> loops,
+                                          ArrayRef<unsigned> permutation) {
+  assert(loops.size() == permutation.size());
+
+  // Work on a mutable copy tracking the current position of each original loop.
+  SmallVector<scf::ForOp> current(loops.begin(), loops.end());
+
+  // Build the inverse: pos[i] = current index of original loop i.
+  SmallVector<unsigned> pos(loops.size());
+  for (unsigned i = 0; i < loops.size(); ++i)
+    pos[i] = i;
+
+  // For each target position i (outermost first), bubble the desired loop
+  // down from its current position using adjacent interchanges.
+  for (unsigned i = 0; i < permutation.size(); ++i) {
+    unsigned want = permutation[i]; // original index we want at position i
+    unsigned cur = pos[want];       // where it currently sits
+
+    // Bubble it up (swap with predecessor) until it reaches position i.
+    while (cur > i) {
+      interchangeLoops(current[cur - 1], current[cur]);
+      // Update tracking.
+      unsigned orig_above = 0;
+      for (unsigned j = 0; j < loops.size(); ++j)
+        if (pos[j] == cur - 1) { orig_above = j; break; }
+      std::swap(current[cur - 1], current[cur]);
+      pos[orig_above] = cur;
+      pos[want] = cur - 1;
+      --cur;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 struct LoopReorderingPass
     : public scheduler::impl::LoopReorderingPassBase<LoopReorderingPass> {
   using LoopReorderingPassBase<LoopReorderingPass>::LoopReorderingPassBase;
@@ -327,6 +396,15 @@ struct LoopReorderingPass
                         llvm::outs());
     llvm::outs() << "\n";
 #endif
+
+    // TODO(temp): test reorderLoops by reversing every candidate set.
+    for (auto& info : candidateSets) {
+      unsigned n = info.loops.size();
+      SmallVector<unsigned> perm(n);
+      for (unsigned i = 0; i < n; ++i)
+        perm[i] = n - 1 - i;
+      reorderLoops(info.loops, perm);
+    }
   }
 };
 
