@@ -34,7 +34,7 @@
 #include "mlir/Pass/Pass.h"
 
 #define PASS_NAME "loop-reordering"
-#define DEBUG_LOOPORDER
+// #define DEBUG_LOOPORDER
 
 using namespace mlir;
 
@@ -251,10 +251,9 @@ static void printLoopSummary(scf::ForOp loop, unsigned depth,
   os << "\n";
 }
 
-/// pairOps[i] holds the interleaved ops between set[i] and set[i+1].
-static void printCandidateSet(unsigned idx, ArrayRef<scf::ForOp> set,
-                              ArrayRef<SmallVector<InterleavedOpInfo>> pairOps,
-                              llvm::raw_ostream& os) {
+[[maybe_unused]] static void printCandidateSet(
+    unsigned idx, ArrayRef<scf::ForOp> set,
+    ArrayRef<SmallVector<InterleavedOpInfo>> pairOps, llvm::raw_ostream& os) {
   os << "\n┌─ Candidate Set " << idx << " (" << set.size() << " loops) ";
   os << "─────────────────────────────────\n";
   unsigned baseDepth = 0;
