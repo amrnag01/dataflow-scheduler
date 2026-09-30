@@ -44,6 +44,11 @@ static llvm::cl::opt<bool> DisableThisPass(
     "disable-" PASS_NAME, llvm::cl::desc("Disable Tile Size Selection pass"),
     llvm::cl::init(false));
 
+static llvm::cl::list<int64_t> ClTileSizes(
+    "tile-sizes",
+    llvm::cl::desc("Tile sizes for each reserved dimension (global override)"),
+    llvm::cl::ZeroOrMore, llvm::cl::CommaSeparated);
+
 using namespace mlir;
 
 namespace mlir::ktdf {
@@ -189,6 +194,20 @@ struct TileSizeSelectionPass
       reserve_size_ops.push_back(reserve_size_op);
     });
 
+    if (reserve_size_ops.empty()) return;
+
+    ArrayRef<int64_t> effective_tile_sizes(ClTileSizes);
+
+    if (!effective_tile_sizes.empty() &&
+        effective_tile_sizes.size() != reserve_size_ops.size()) {
+      module.emitError() << "[" PASS_NAME
+                         << "] Number of tile sizes specified ("
+                         << effective_tile_sizes.size()
+                         << ") does not match the number of reserve_size ops ("
+                         << reserve_size_ops.size() << ")";
+      return signalPassFailure();
+    }
+
     SmallVector<TileSizeInfo> analyses;
     analyses.reserve(reserve_size_ops.size());
 
@@ -203,9 +222,13 @@ struct TileSizeSelectionPass
     }
 
     OpBuilder builder(module.getContext());
-    for (TileSizeInfo& ts_info : analyses) {
-      std::optional<int64_t> chosen_tile_size =
-          chooseTileSize(ts_info, unresolved_ops);
+    for (auto [idx, ts_info] : llvm::enumerate(analyses)) {
+      std::optional<int64_t> chosen_tile_size;
+      if (!effective_tile_sizes.empty()) {
+        chosen_tile_size = effective_tile_sizes[idx];
+      } else {
+        chosen_tile_size = chooseTileSize(ts_info, unresolved_ops);
+      }
       if (!chosen_tile_size.has_value()) {
         continue;
       }

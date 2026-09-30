@@ -1,8 +1,8 @@
-// RUN: dataflow-scheduler-opt --construct-three-stage-pipeline %s | FileCheck %s
+// RUN: dataflow-scheduler-opt --convert-elementwise-to-linalg --linalg-morph-ops="category-to-generic=true named-to-generic=true" --fuse-linalg --construct-three-stage-pipeline %s | FileCheck %s
 
 // CHECK: #[[$ATTR_0:.+]] = affine_map<(d0, d1) -> (d0, d1)>
 // CHECK: #[[$ATTR_1:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 95 >= 0, d1 >= 0, -d1 + 63 >= 0)>
-// CHECK-LABEL:   func.func @local_schedule_1(
+// CHECK-LABEL:   func.func @arith_math_test(
 // CHECK-SAME:      %[[ARG0:.*]]: index) {
 // CHECK-NEXT:     %[[CONSTANT_0:.*]] = arith.constant 1 : index
 // CHECK-NEXT:     %[[CONSTANT_1:.*]] = arith.constant 64 : index
@@ -14,7 +14,6 @@
 // CHECK-NEXT:     %[[GET_COMPUTE_TILE_ID_0:.*]] = ktdp.get_compute_tile_id : index
 // CHECK-NEXT:     %[[MULI_0:.*]] = arith.muli %[[GET_COMPUTE_TILE_ID_0]], %[[CONSTANT_2]] : index
 // CHECK-NEXT:     %[[ADDI_0:.*]] = arith.addi %[[MULI_0]], %[[ARG0]] : index
-// CHECK-NEXT:     %[[EMPTY_0:.*]] = tensor.empty() : tensor<1x64xf16>
 // CHECK-NEXT:     %[[CONSTANT_7:.*]] = arith.constant 0 : index
 // CHECK-NEXT:     %[[CONSTANT_8:.*]] = arith.constant 1 : index
 // CHECK-NEXT:     %[[CONSTANT_9:.*]] = arith.constant 1 : index
@@ -61,12 +60,13 @@
 // CHECK-NEXT:             %[[READ_FROM_FIFO_0:.*]] = ktdf.read_from_fifo %[[PRIVATE_0]]#0 : <"DDR" -> "SFU", 64xf16> -> tensor<1x64xf16>
 // CHECK-NEXT:             %[[READ_FROM_FIFO_1:.*]] = ktdf.read_from_fifo %[[PRIVATE_0]]#1 : <"DDR" -> "SFU", 64xf16> -> tensor<1x64xf16>
 // CHECK-NEXT:             %[[READ_FROM_FIFO_2:.*]] = ktdf.read_from_fifo %[[PRIVATE_0]]#2 : <"DDR" -> "SFU", 64xf16> -> tensor<1x64xf16>
-// CHECK-NEXT:             %[[EMPTY_1:.*]] = tensor.empty() : tensor<1x64xf16>
-// CHECK-NEXT:             %[[GENERIC_0:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_0]], #[[$ATTR_0]], #[[$ATTR_0]]], iterator_types = ["parallel", "parallel"]} ins(%[[READ_FROM_FIFO_2]], %[[READ_FROM_FIFO_0]], %[[READ_FROM_FIFO_1]] : tensor<1x64xf16>, tensor<1x64xf16>, tensor<1x64xf16>) outs(%[[EMPTY_1]] : tensor<1x64xf16>) attrs =  {ktdf_arch.maps_to = "SFU"} {
+// CHECK-NEXT:             %[[EMPTY_0:.*]] = tensor.empty() : tensor<1x64xf16>
+// CHECK-NEXT:             %[[GENERIC_0:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_0]], #[[$ATTR_0]], #[[$ATTR_0]]], iterator_types = ["parallel", "parallel"]} ins(%[[READ_FROM_FIFO_0]], %[[READ_FROM_FIFO_1]], %[[READ_FROM_FIFO_2]] : tensor<1x64xf16>, tensor<1x64xf16>, tensor<1x64xf16>) outs(%[[EMPTY_0]] : tensor<1x64xf16>) attrs =  {ktdf_arch.maps_to = "SFU"} {
 // CHECK-NEXT:             ^bb0(%[[VAL_4:.*]]: f16, %[[VAL_5:.*]]: f16, %[[VAL_6:.*]]: f16, %[[VAL_7:.*]]: f16):
-// CHECK-NEXT:               %[[ADDF_0:.*]] = arith.addf %[[VAL_5]], %[[VAL_6]] : f16
-// CHECK-NEXT:               %[[ADDF_1:.*]] = arith.addf %[[VAL_4]], %[[ADDF_0]] : f16
-// CHECK-NEXT:               linalg.yield %[[ADDF_1]] : f16
+// CHECK-NEXT:               %[[SQRT_0:.*]] = math.sqrt %[[VAL_6]] : f16
+// CHECK-NEXT:               %[[MULF_0:.*]] = arith.mulf %[[VAL_4]], %[[VAL_5]] : f16
+// CHECK-NEXT:               %[[ADDF_0:.*]] = arith.addf %[[MULF_0]], %[[SQRT_0]] : f16
+// CHECK-NEXT:               linalg.yield %[[ADDF_0]] : f16
 // CHECK-NEXT:             } -> tensor<1x64xf16>
 // CHECK-NEXT:             ktdf.write_to_fifo %[[GENERIC_0]], %[[PRIVATE_0]]#3 : tensor<1x64xf16>, <"SFU" -> "DDR", 64xf16>
 // CHECK-NEXT:           } {applicable_units = ["SFU"]}
@@ -79,88 +79,82 @@
 // CHECK-NEXT:     return
 // CHECK-NEXT:   }
 
-
 module {
     ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">} import("../../../../Dialect/KTDFArch/sample_device.mlir")
-    func.func @local_schedule_1(%i: index) {
+    func.func @arith_math_test(%i: index) {
         %c0 = arith.constant 0 : index
         %tile_size = arith.constant 3 : index
         %A_start_address = arith.constant 1024 : index
         %B_start_address = arith.constant 12288 : index
-        %D_start_address = arith.constant 18432 : index
-        %E_start_address = arith.constant 24576 : index
+        %C_start_address = arith.constant 18432 : index
+        %D_start_address = arith.constant 24576 : index
 
         %id = ktdp.get_compute_tile_id : index
         %start_row = arith.muli %id, %tile_size : index
     
-        // Construct a memory view of A from a given address
+        // Construct memory views
         %A_view = ktdp.construct_memory_view %A_start_address, sizes: [96, 64], strides: [64, 1] {
             coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 95 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
             memory_space = #ktdp.memory_space<global>
         } : memref<96x64xf16>
     
-        // Construct a memory view of B from a given address
         %B_view = ktdp.construct_memory_view %B_start_address, sizes: [96, 64], strides: [64, 1] {
             coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 95 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
             memory_space = #ktdp.memory_space<global>
         } : memref<96x64xf16>
     
-        // Construct a memory view of D from a given address
-        %D_view = ktdp.construct_memory_view %D_start_address, sizes: [96, 64], strides: [64, 1] {
+        %C_view = ktdp.construct_memory_view %C_start_address, sizes: [96, 64], strides: [64, 1] {
             coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 95 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
             memory_space = #ktdp.memory_space<global>
         } : memref<96x64xf16>
-        
-        // Construct a memory view of E from a given address
-        %E_view = ktdp.construct_memory_view %E_start_address, sizes: [96, 64], strides: [64, 1] {
+
+        %D_view = ktdp.construct_memory_view %D_start_address, sizes: [96, 64], strides: [64, 1] {
             coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 95 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
             memory_space = #ktdp.memory_space<global>
         } : memref<96x64xf16>
 
         %start_row_i = arith.addi %start_row, %i : index
         
-        // Construct an access tile from the memory view of A
+        // Construct access tiles
         %A_access_tile = ktdp.construct_access_tile %A_view[%start_row_i, %c0] {
             access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
             access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
         } : memref<96x64xf16> -> !ktdp.access_tile<1x64xindex>
 
-        // Construct an access tile from the memory view of B
         %B_access_tile = ktdp.construct_access_tile %B_view[%start_row_i, %c0] {
             access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
             access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
         } : memref<96x64xf16> -> !ktdp.access_tile<1x64xindex>
 
-        // Construct an access tile from the memory view of B
+        %C_access_tile = ktdp.construct_access_tile %C_view[%start_row_i, %c0] {
+            access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
+            access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+        } : memref<96x64xf16> -> !ktdp.access_tile<1x64xindex>
+
+        // Load data
+        %A_data_tile = ktdp.load %A_access_tile : !ktdp.access_tile<1x64xindex> -> tensor<1x64xf16>
+        %B_data_tile = ktdp.load %B_access_tile : !ktdp.access_tile<1x64xindex> -> tensor<1x64xf16>
+        %C_data_tile = ktdp.load %C_access_tile : !ktdp.access_tile<1x64xindex> -> tensor<1x64xf16>
+
+        // Apply arith operation: multiply A and B element-wise
+        %AB_mul = arith.mulf %A_data_tile, %B_data_tile : tensor<1x64xf16>
+
+        // Apply math operation: square root of C
+        %C_sqrt = math.sqrt %C_data_tile : tensor<1x64xf16>
+
+        // Add the results using linalg.add
+        %result_empty = tensor.empty() : tensor<1x64xf16>
+        %result = linalg.add ins(%AB_mul, %C_sqrt : tensor<1x64xf16>, tensor<1x64xf16>)
+                    outs(%result_empty: tensor<1x64xf16>) -> tensor<1x64xf16>
+
+        // Construct access tile for output
         %D_access_tile = ktdp.construct_access_tile %D_view[%start_row_i, %c0] {
             access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
             access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
         } : memref<96x64xf16> -> !ktdp.access_tile<1x64xindex>
 
-        // Load data from the corresponding access tile
-        %A_data_tile = ktdp.load %A_access_tile : !ktdp.access_tile<1x64xindex> -> tensor<1x64xf16>
-
-        %B_data_tile = ktdp.load %B_access_tile : !ktdp.access_tile<1x64xindex> -> tensor<1x64xf16>
-        %D_data_tile = ktdp.load %D_access_tile : !ktdp.access_tile<1x64xindex> -> tensor<1x64xf16>
-
-        %E_data_tile = tensor.empty() : tensor<1x64xf16>
-
-        // Perform add operation on the data tiles.
-        %C_data_tile = tensor.empty() : tensor<1x64xf16>
-        %result = linalg.add ins(%A_data_tile, %B_data_tile : tensor<1x64xf16>, tensor<1x64xf16>)
-                    outs(%C_data_tile: tensor<1x64xf16>) -> tensor<1x64xf16>
-
-        %result_2 = linalg.add ins(%D_data_tile, %result : tensor<1x64xf16>, tensor<1x64xf16>)
-                    outs(%E_data_tile: tensor<1x64xf16>) -> tensor<1x64xf16>
-
-        // Construct an access tile from the memory view of E
-        %E_access_tile = ktdp.construct_access_tile %E_view[%start_row_i, %c0] {
-            access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-            access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
-        } : memref<96x64xf16> -> !ktdp.access_tile<1x64xindex>
-
-        // Store data into the access tile.
-        ktdp.store %result_2, %E_access_tile : tensor<1x64xf16>, !ktdp.access_tile<1x64xindex>
+        // Store result
+        ktdp.store %result, %D_access_tile : tensor<1x64xf16>, !ktdp.access_tile<1x64xindex>
         
         return
     }

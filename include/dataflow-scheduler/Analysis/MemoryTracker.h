@@ -41,9 +41,6 @@ class MemoryTree;
 /// information for each memory resource.
 class MemoryTracker {
  public:
-  /// First available address for allocations (starts at 0)
-  static constexpr size_t kFirstAvailableAddress = 0;
-
   /// @brief Construct a MemoryTracker from a MemoryTree
   /// @param memory_tree The memory hierarchy view containing capacity info
   explicit MemoryTracker(const arch_view::MemoryTree& memory_tree);
@@ -58,12 +55,12 @@ class MemoryTracker {
 
   /// @brief Get the current next available address for a memory resource
   /// @param memory_resource The memory resource attribute to query
-  /// @return The next available address, or 0 if not yet allocated
+  /// @return The next available address; asserts if the resource is unknown
   size_t getNextAvailableAddress(ResourceType memory_resource) const;
 
   /// @brief Get the total allocated size for a memory resource
   /// @param memory_resource The memory resource attribute to query
-  /// @return Total bytes allocated in this memory resource
+  /// @return Total bytes allocated in this memory resource; asserts if unknown
   size_t getTotalAllocated(ResourceType memory_resource) const;
 
   /// @brief Puts each of \p memory_resources back to its first address
@@ -71,14 +68,20 @@ class MemoryTracker {
   void reset(llvm::ArrayRef<ResourceType> memory_resources);
 
  private:
-  /// Memory resource capacities (available bytes per resource)
+  /// Memory resource capacities (total bytes per resource)
   llvm::DenseMap<ResourceType, size_t> capacities_;
+
+  /// Reserved bytes per resource — first allocatable address after reset
+  llvm::DenseMap<ResourceType, size_t> reserved_;
 
   /// Track next available address per memory resource attribute
   llvm::DenseMap<ResourceType, size_t> next_address_;
 
   /// Helper to align an address to the specified alignment
   static size_t alignAddress(size_t address, size_t alignment);
+
+  /// Helper to produce a printable string for a memory resource
+  static std::string resourceToString(ResourceType memory_resource);
 };
 
 }  // namespace scheduler

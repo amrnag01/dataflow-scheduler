@@ -19,10 +19,10 @@
 // Pass: -double-buffering
 //
 // Detects scratchpad memrefs handed off between sibling stages of a
-// ktdf.pipeline (single producer, >=1 consumer via ktdf.data_transfer) and
-// rewrites them into a ping-pong form: paired allocs hoisted outside the
-// pipeline scope, ktdf.buffer_phase + per-buffer ktdf.select_memref
-// inserted before the pipeline, and modulo(size: 2) set on the pipeline.
+// ktdf.pipeline (single producer, >=1 consumer via data transfer operations)
+// and rewrites them into a ping-pong form: paired allocs hoisted outside the
+// pipeline scope, ktdf.buffer_phase + per-buffer ktdf.select_memref inserted
+// before the pipeline, and modulo(size: 2) set on the pipeline.
 //
 //===----------------------------------------------------------------------===//
 
@@ -187,8 +187,9 @@ struct Candidate {
 };
 
 /// Walk the entire region of each sibling stage of `pipeline` recursively,
-/// classifying every ktdf.data_transfer that references `buffer` as producer
-/// (buffer is dest) or consumer (buffer is source). Stages are deduplicated.
+/// classifying every ktdf.data_transfer or ktdf.ind_data_transfer that
+/// references `buffer` as producer (buffer is write target) or consumer
+/// (buffer is read source). Stages are deduplicated.
 /// Returns std::nullopt iff a sibling stage is both producer and consumer.
 std::optional<std::pair<llvm::SmallVector<mlir::ktdf::StageOp>,
                         llvm::SmallVector<mlir::ktdf::StageOp>>>
@@ -197,11 +198,22 @@ scanProducersConsumers(mlir::ktdf::PipelineOp pipeline, mlir::Value buffer) {
   llvm::SmallSetVector<mlir::ktdf::StageOp, 4> consumers;
 
   for (auto stage : pipeline.getStages()) {
-    stage->walk([&](mlir::ktdf::DataTransferOp xfer) {
-      if (xfer.getDestination() == buffer) {
+    stage->walk([&](mlir::Operation* op) {
+      mlir::Value write_buffer;
+      mlir::Value read_buffer;
+      if (auto xfer = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op)) {
+        write_buffer = xfer.getDestination();
+        read_buffer = xfer.getSource();
+      } else if (auto ind = mlir::dyn_cast<mlir::ktdf::IndDataTransferOp>(op)) {
+        write_buffer = ind.getDirDst();
+        read_buffer = ind.getDirSrc();
+      } else {
+        return;
+      }
+      if (write_buffer == buffer) {
         producers.insert(stage);
       }
-      if (xfer.getSource() == buffer) {
+      if (read_buffer == buffer) {
         consumers.insert(stage);
       }
     });

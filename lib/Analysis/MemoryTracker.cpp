@@ -19,24 +19,34 @@
 #include "dataflow-scheduler/Analysis/MemoryTracker.h"
 
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
+#include "llvm/Support/DebugLog.h"
 #include "llvm/Support/ErrorHandling.h"
+
+#define DEBUG_TYPE "memory-tracker"
 
 using namespace scheduler;
 
 MemoryTracker::MemoryTracker(const arch_view::MemoryTree& memory_tree) {
-  // Extract capacities from the memory tree
   for (auto node_id : memory_tree.getAllNodeIds()) {
     auto node = memory_tree.getNode(node_id);
     if (node && node->capacity_in_bytes) {
-      // Use available capacity (capacity - reserved)
-      size_t available = *node->capacity_in_bytes;
-      if (node->reserved_in_bytes) {
-        available -= *node->reserved_in_bytes;
-      }
-      capacities_[node->memory_resource] = available;
-      next_address_[node->memory_resource] = kFirstAvailableAddress;
+      size_t reserved = node->reserved_in_bytes.value_or(0);
+      capacities_[node->memory_resource] = *node->capacity_in_bytes;
+      reserved_[node->memory_resource] = reserved;
+      next_address_[node->memory_resource] = reserved;
     }
   }
+}
+
+std::string MemoryTracker::resourceToString(ResourceType memory_resource) {
+  std::string str;
+  llvm::raw_string_ostream rso(str);
+  if (memory_resource) {
+    memory_resource.print(rso);
+  } else {
+    rso << "<null>";
+  }
+  return str;
 }
 
 size_t MemoryTracker::alignAddress(size_t address, size_t alignment) {
@@ -66,40 +76,33 @@ llvm::Expected<size_t> MemoryTracker::allocate(ResourceType memory_resource,
   // Query the available capacity
   auto capacity_it = capacities_.find(memory_resource);
   if (capacity_it == capacities_.end()) {
-    std::string resource_str;
-    llvm::raw_string_ostream ss(resource_str);
-    if (memory_resource) {
-      memory_resource.print(ss);
-    } else {
-      ss << "<null>";
-    }
     return llvm::createStringError(
         llvm::inconvertibleErrorCode(),
         "Memory resource %s does not have capacity information",
-        ss.str().c_str());
+        resourceToString(memory_resource).c_str());
   }
 
-  size_t available_capacity = capacity_it->second;
-
   // Check if allocation fits
-  if (new_next_address > available_capacity) {
-    std::string resource_str;
-    llvm::raw_string_ostream ss(resource_str);
-    if (memory_resource) {
-      memory_resource.print(ss);
-    } else {
-      ss << "<null>";
-    }
+  if (new_next_address > capacity_it->second) {
     return llvm::createStringError(
         llvm::inconvertibleErrorCode(),
         "Allocation of %zu bytes (aligned to %zu) exceeds %s capacity "
-        "(%zu bytes available, %zu bytes already allocated)",
-        size_in_bytes, alignment, ss.str().c_str(), available_capacity,
-        current_address);
+        "(%zu bytes of capacity, %zu bytes already allocated)",
+        size_in_bytes, alignment, resourceToString(memory_resource).c_str(),
+        capacity_it->second, current_address);
   }
 
   // Update the next address
   next_address_[memory_resource] = new_next_address;
+
+  size_t capacity = capacity_it->second;
+  LDBG(1) << "[" DEBUG_TYPE "] allocate: resource="
+          << resourceToString(memory_resource) << " requested=" << size_in_bytes
+          << "B"
+          << " aligned_addr=" << aligned_address << " used=" << new_next_address
+          << "B"
+          << " free=" << (capacity - new_next_address) << "B"
+          << " capacity=" << capacity << "B";
 
   return aligned_address;
 }
@@ -107,21 +110,25 @@ llvm::Expected<size_t> MemoryTracker::allocate(ResourceType memory_resource,
 size_t MemoryTracker::getNextAvailableAddress(
     ResourceType memory_resource) const {
   auto it = next_address_.find(memory_resource);
-  if (it == next_address_.end()) {
-    return kFirstAvailableAddress;
-  }
+  assert(it != next_address_.end() &&
+         "Memory resource not found in next_address_ map");
   return it->second;
 }
 
 size_t MemoryTracker::getTotalAllocated(ResourceType memory_resource) const {
-  // Total allocated is the current next address minus the first address
-  return getNextAvailableAddress(memory_resource) - kFirstAvailableAddress;
+  auto reserved_it = reserved_.find(memory_resource);
+  assert(reserved_it != reserved_.end() &&
+         "Memory resource not found in reserved_ map");
+  return getNextAvailableAddress(memory_resource) - reserved_it->second;
 }
 
 void MemoryTracker::reset(llvm::ArrayRef<ResourceType> memory_resources) {
   for (ResourceType resource : memory_resources) {
     auto it = next_address_.find(resource);
-    if (it != next_address_.end()) it->second = kFirstAvailableAddress;
+    if (it != next_address_.end()) {
+      auto reserved_it = reserved_.find(resource);
+      it->second = reserved_it != reserved_.end() ? reserved_it->second : 0;
+    }
   }
 }
 

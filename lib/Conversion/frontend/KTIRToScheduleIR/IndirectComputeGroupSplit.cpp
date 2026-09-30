@@ -332,6 +332,10 @@ struct AddressBufferInfo {
   /// Memory resource the address buffer is allocated from: the root
   /// ancestor of the node that carries the indirect_address_buffer feature.
   ResourceType global_resource;
+  /// Memory space name of the IAB node itself derived from the resource that
+  /// carries the indirect_address_buffer feature.  Used as the memref
+  /// memory_space attribute for the IAB view.
+  StringAttr iab_mem_space;
 };
 
 /// The orchestrator-side state every candidate needs, likewise resolved once.
@@ -496,8 +500,10 @@ static FailureOr<AddressBufferInfo> resolveAddressBufferInfo(
   LDBG(1) << "IAB entry type " << entry_type << ", address arithmetic in "
           << compute_type;
 
+  StringAttr iab_mem_space = cast<StringAttr>(iab_node->memory_resource);
   return AddressBufferInfo{entry_type, compute_type,
-                           memory_tree.getRootOf(*iab_node).memory_resource};
+                           memory_tree.getRootOf(*iab_node).memory_resource,
+                           iab_mem_space};
 }
 
 /// Locates the orchestrator module, its function and every call that function
@@ -948,7 +954,7 @@ static std::string buildIdxToAddrModule(
 static void rewriteGatherScatterModule(
     ktdp::ConstructIndirectAccessTilesOp indirect_op,
     ktdp::ConstructMemoryViewOp idx_view, size_t addr_buf_base,
-    unsigned indir_dim, Type compute_type,
+    unsigned indir_dim, Type compute_type, StringAttr iab_mem_space,
     DenseI32ArrayAttr ind_addr_buf_dim_positions) {
   auto func = indirect_op->getParentOfType<func::FuncOp>();
   assert(func && "indirect_op must be enclosed in a FuncOp");
@@ -977,7 +983,6 @@ static void rewriteGatherScatterModule(
   // is a plain StringAttr, which ktdp.construct_memory_view rejects at
   // verification time — it constrains $memory_space to a Ktdp_MemorySpaceAttr.
   // IAB entries are flat absolute addresses, hence the `index` element type.
-  StringAttr iab_mem_space = builder.getStringAttr("IAB");
   Type index_type = builder.getIndexType();
   Value iab_view = ktdp_lowering::ConstructMemoryViewOp::create(
       builder, loc,
@@ -1210,7 +1215,7 @@ static LogicalResult splitCandidate(const SplitCandidate& candidate,
 
   rewriteGatherScatterModule(candidate.indirect_op, candidate.idx_view,
                              *addr_buf_base, candidate.indir_dim,
-                             addr_info.compute_type,
+                             addr_info.compute_type, addr_info.iab_mem_space,
                              candidate.ind_addr_buf_dim_positions);
 
   if (candidate.call_site)

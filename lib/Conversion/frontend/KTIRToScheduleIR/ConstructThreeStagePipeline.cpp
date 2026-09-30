@@ -20,8 +20,6 @@
 //
 // This pass performs the following steps in order to create a three-stage
 // pipeline:
-//   Step 1: Generalize linalg, arith, and math operations to linalg.generic
-//   Step 2: Fuse consecutive linalg.generic operations
 //   Step 3: Create loops from linalg operations (tiling)
 //   Step 4: Create pipeline with three stages (load, compute, store)
 //   Step 5: Replace access tiles with memref.reinterpret_cast
@@ -162,19 +160,13 @@ struct ConstructThreeStagePipelinePass
   // Reset state between function processing
   void resetState();
 
-  // Generalize named linalg operations to linalg.generic
-  mlir::LogicalResult generalizeLinalgArithMathOps(mlir::func::FuncOp func_op);
-
-  // Fuse consecutive linalg.generic operations
-  mlir::LogicalResult fuseLinalgOps(mlir::func::FuncOp func_op);
-
   // Determine tile sizes based on vector_length from linalg operation
   llvm::SmallVector<int64_t> determineTileSizes(
       mlir::linalg::LinalgOp linalgOp);
 
   // Create loops from linalg operations by tiling
   void createLoopsFromLinalg(
-      llvm::SmallVectorImpl<mlir::linalg::LinalgOp>& linalg_ops);
+      llvm::SmallVectorImpl<mlir::linalg::GenericOp>& linalg_ops);
 
   // Create a 3-stage pipeline inside innermost_loop, with one stage for loads,
   // computes, stores.
@@ -261,130 +253,6 @@ void ConstructThreeStagePipelinePass::resetState() {
   tile_sizes_.clear();
   ops_to_delete_.clear();
   const_builder_.reset();
-}
-
-mlir::LogicalResult
-ConstructThreeStagePipelinePass::generalizeLinalgArithMathOps(
-    mlir::func::FuncOp func_op) {
-  LDBG(1)
-      << "Generalizing linalg, arith, and math operations to linalg.generic";
-
-  llvm::SmallVector<mlir::linalg::LinalgOp> linalg_ops;
-
-  func_op.walk([&](mlir::Operation* op) {
-    // Collect linalg operations that are not already generic
-    if (auto linalg_op = mlir::dyn_cast<mlir::linalg::LinalgOp>(op)) {
-      if (!mlir::isa<mlir::linalg::GenericOp>(op)) {
-        linalg_ops.push_back(linalg_op);
-      }
-    }
-  });
-
-  mlir::IRRewriter rewriter(&getContext());
-
-  // Generalize named linalg operations
-  for (mlir::linalg::LinalgOp linalg_op : linalg_ops) {
-    LDBG(1) << "  Generalizing linalg op: " << linalg_op->getName() << "";
-    rewriter.setInsertionPoint(linalg_op);
-
-    llvm::FailureOr<mlir::linalg::GenericOp> generic_result =
-        mlir::linalg::generalizeNamedOp(rewriter, linalg_op);
-
-    if (mlir::failed(generic_result)) {
-      linalg_op.emitError("Failed to generalize linalg operation");
-      return mlir::failure();
-    }
-  }
-
-  // Convert arith and math operations to linalg using elementwise patterns
-  LDBG(1) << "  Converting arith/math operations";
-
-  mlir::RewritePatternSet patterns(&getContext());
-  mlir::linalg::populateElementwiseToLinalgConversionPatterns(patterns);
-
-  if (mlir::failed(mlir::applyPatternsGreedily(func_op, std::move(patterns)))) {
-    func_op.emitError(
-        "Failed to convert arith/math operations to linalg.generic");
-    return mlir::failure();
-  }
-
-  LDBG(1) << "  Successfully generalized compute ops to linalg.generic";
-  return mlir::success();
-}
-
-mlir::LogicalResult ConstructThreeStagePipelinePass::fuseLinalgOps(
-    mlir::func::FuncOp func_op) {
-  LDBG(1) << "Fusing consecutive linalg.generic operations";
-
-  llvm::SmallVector<mlir::linalg::GenericOp> worklist;
-  func_op.walk([&](mlir::linalg::GenericOp generic_op) {
-    worklist.push_back(generic_op);
-  });
-
-  mlir::IRRewriter rewriter(&getContext());
-  while (!worklist.empty()) {
-    mlir::linalg::GenericOp consumer = worklist.pop_back_val();
-
-    // Try to fuse producer into this consumer
-    for (mlir::OpOperand* operand : consumer.getDpsInputOperands()) {
-      mlir::Value input = operand->get();
-      auto producer = input.getDefiningOp<mlir::linalg::GenericOp>();
-
-      if (!producer) continue;
-
-      rewriter.setInsertionPoint(consumer);
-      // TODO: we may want do non-element-wise fusion as well such as matmul
-      // followed by add.
-      llvm::FailureOr<mlir::linalg::ElementwiseOpFusionResult> fusion_result =
-          mlir::linalg::fuseElementwiseOps(rewriter, operand);
-
-      if (mlir::succeeded(fusion_result)) {
-        LDBG(1) << "  Successfully fused operations";
-        auto fused_op =
-            mlir::cast<mlir::linalg::GenericOp>(fusion_result->fusedOp);
-
-        // Immediately after fusion: ensure every outs operand of the fused op
-        // is a fresh tensor.empty. fuseElementwiseOps can pull a live producer
-        // result into the outs position; replace it now so the rest of the
-        // pipeline always sees a clean init tensor.
-        for (int64_t i = 0, e = fused_op.getNumDpsInits(); i < e; ++i) {
-          mlir::OpOperand* init_operand = fused_op.getDpsInitOperand(i);
-          mlir::Value outs_val = init_operand->get();
-          if (mlir::isa_and_present<mlir::tensor::EmptyOp>(
-                  outs_val.getDefiningOp())) {
-            continue;  // already a tensor.empty – nothing to do
-          }
-          auto tensor_type =
-              mlir::dyn_cast<mlir::RankedTensorType>(outs_val.getType());
-          if (!tensor_type) continue;
-
-          rewriter.setInsertionPoint(fused_op);
-          auto empty = mlir::tensor::EmptyOp::create(
-              rewriter, fused_op.getLoc(), tensor_type.getShape(),
-              tensor_type.getElementType());
-          rewriter.modifyOpInPlace(
-              fused_op, [&]() { init_operand->set(empty.getResult()); });
-        }
-
-        // Replace uses of consumer with the fused operation (this also erases
-        // consumer)
-        rewriter.replaceOp(consumer, fused_op->getResults());
-
-        // Erase the original producer operation
-        rewriter.eraseOp(producer);
-
-        // Remove producer from worklist if present
-        llvm::erase(worklist, producer);
-
-        // Add the fused operation to the worklist for further fusion in the
-        // next iteration.
-        worklist.push_back(fused_op);
-        break;
-      }
-    }
-  }
-
-  return mlir::success();
 }
 
 // Given a shape and a target vector_length, compute per-dimension tile sizes
@@ -544,14 +412,14 @@ void ConstructThreeStagePipelinePass::annotateLoopsWithIteratorTypes(
 }
 
 void ConstructThreeStagePipelinePass::createLoopsFromLinalg(
-    llvm::SmallVectorImpl<mlir::linalg::LinalgOp>& linalg_ops) {
+    llvm::SmallVectorImpl<mlir::linalg::GenericOp>& linalg_ops) {
   LDBG(1) << "Creating SCF loops from linalg.generic operations";
 
   assert(linalg_ops.size() <= 1 &&
          "Currently only supporting one linalg.generic operation after fusion");
 
   mlir::IRRewriter rewriter(&getContext());
-  for (mlir::linalg::LinalgOp& linalg_op : linalg_ops) {
+  for (auto& linalg_op : linalg_ops) {
     LDBG(1) << "  Processing: " << linalg_op->getName() << "";
 
     rewriter.setInsertionPoint(linalg_op);
@@ -598,12 +466,12 @@ void ConstructThreeStagePipelinePass::createLoopsFromLinalg(
     // Erase the original linalg operation. It has been replaced by a loop nest
     // containing the tiled linalg operation.
     rewriter.eraseOp(linalg_op);
+    linalg_op =
+        mlir::cast<mlir::linalg::GenericOp>(tiled_result->op.getOperation());
 
     // Annotate loops with loop_type attributes based on iterator types
     if (!tiled_result->loops.empty()) {
-      auto generic_op = mlir::dyn_cast<mlir::linalg::GenericOp>(
-          tiled_result->op.getOperation());
-      annotateLoopsWithIteratorTypes(tiled_result->loops, generic_op);
+      annotateLoopsWithIteratorTypes(tiled_result->loops, linalg_op);
     }
 
     LDBG(1) << "  Successfully tiled linalg operation";
@@ -613,8 +481,6 @@ void ConstructThreeStagePipelinePass::createLoopsFromLinalg(
       tiled_loops_.assign(tiled_result->loops.begin(),
                           tiled_result->loops.end());
     }
-
-    linalg_op = tiled_result->op;
   }
 }
 
@@ -1438,27 +1304,8 @@ void ConstructThreeStagePipelinePass::runOnFunc(mlir::func::FuncOp func_op) {
     const_builder_->setInsertionPointToStart(&func_op.front());
   }
 
-  // Step 1: Generalize named linalg operations and arith/math operations to
-  // linalg.generic
-  if (mlir::failed(generalizeLinalgArithMathOps(func_op))) {
-    func_op.emitError("Failed to generalize linalg operations");
-    signalPassFailure();
-    return;
-  }
-
-  LDBG(1) << "After generalization:\n" << func_op << "\n";
-
-  // Step 2: Fuse consecutive linalg.generic operations
-  if (mlir::failed(fuseLinalgOps(func_op))) {
-    func_op.emitError("Failed to fuse linalg operations");
-    signalPassFailure();
-    return;
-  }
-
-  LDBG(1) << "After fusion:\n" << func_op << "\n";
-
   // Collect ktdp load/store operations and linalg operations
-  llvm::SmallVector<mlir::linalg::LinalgOp> linalg_ops;
+  llvm::SmallVector<mlir::linalg::GenericOp> linalg_ops;
   func_op.walk([&](mlir::Operation* op) {
     if (auto load_op = mlir::dyn_cast<mlir::ktdp::LoadOp>(op)) {
       load_ops_.push_back(load_op);
@@ -1466,7 +1313,7 @@ void ConstructThreeStagePipelinePass::runOnFunc(mlir::func::FuncOp func_op) {
     } else if (auto store_op = mlir::dyn_cast<mlir::ktdp::StoreOp>(op)) {
       store_ops_.push_back(store_op);
       ops_to_delete_.push_back(op);
-    } else if (auto linalg_op = mlir::dyn_cast<mlir::linalg::LinalgOp>(op)) {
+    } else if (auto linalg_op = mlir::dyn_cast<mlir::linalg::GenericOp>(op)) {
       linalg_ops.push_back(linalg_op);
     }
   });

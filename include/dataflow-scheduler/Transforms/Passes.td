@@ -544,4 +544,25 @@ def HoistConstantStoragePass : Pass<"hoist-constant-storage", "mlir::func::FuncO
   ];
 }
 
+def IndirectAddrBufLegalizationPass
+    : Pass<"indirect-addr-buf-legalization", "mlir::ModuleOp"> {
+  let summary = "Legalize indirect address buffer usage";
+  let description = [{
+    Materializes the ind_addr_buf window loop and per-entry loop required by
+    the hardware indirect address buffer constraint.
+    Outer scf.for over ind_addr_buf windows (annotated parallel), then inner
+    scf.for over entries; the ind_addr_buf fill only runs on the entry loop's
+    first iteration, guarded by an scf.if on the entry induction variable,
+    with the ind_addr_buf memref view hoisted once above the entire
+    window/entry loop nest instead of threaded as an scf.for iter-arg.
+    No-op when no ktdp_lowering.construct_indirect_access_tile is present.
+  }];
+  let constructor = "::scheduler::createIndirectAddrBufLegalizationPass()";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::ktdf::KTDFDialect"
+  ];
+}
+
 #endif // DATAFLOW_SCHEDULER_TRANSFORMS_PASSES_TD
