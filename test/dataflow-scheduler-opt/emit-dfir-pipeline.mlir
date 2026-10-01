@@ -21,6 +21,7 @@
 // CHECK-NEXT:   compute-group-extraction
 // CHECK-NEXT:   indirect-compute-group-split
 // CHECK-NEXT:   indirect-addr-buf-legalization
+// CHECK-NEXT:   indirect-access-loop-materialization
 // CHECK-NEXT:   builtin.module(
 // CHECK-NEXT:   func.func(
 // CHECK-NEXT:   convert-elementwise-to-linalg,
@@ -45,6 +46,7 @@
 // CHECK-NEXT:   path-expansion
 // CHECK-NEXT:   indirect-addr-buf-fill-legalization
 // CHECK-NEXT:   scalar-broadcast-legalization
+// CHECK-NEXT:   splat-legalization
 // CHECK-NEXT:   normalize-scf-for-loops
 // CHECK-NEXT:   canonicalize
 // CHECK-NEXT:   tile-scf-for-loops
@@ -73,6 +75,7 @@
 // CHECK-NEXT:   apply-device-patterns{groups={post_scheduling}}
 // CHECK-NEXT:   )
 // CHECK-NEXT:   )
+// CHECK-NEXT:   custom-linalg-bufferization
 // CHECK-NEXT:   address-assignment
 // CHECK-NEXT:   normalize-grid-to-1d
 // CHECK-NEXT:   ktdf-to-ktdflowering

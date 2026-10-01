@@ -51,6 +51,7 @@ void scheduler::buildKTIRFrontendPipeline(
   pm.addPass(createComputeGroupExtractionPass());
   pm.addPass(createIndirectComputeGroupSplitPass());
   pm.addPass(createIndirectAddrBufLegalizationPass());
+  pm.addPass(createIndirectAccessLoopMaterializationPass());
   {
     auto& nested = pm.nest<mlir::ModuleOp>().nest<mlir::func::FuncOp>();
     nested.addPass(mlir::createConvertElementwiseToLinalgPass());
@@ -88,6 +89,7 @@ void scheduler::buildSchedulerOptimizationPipeline(
   // whether an indirect address buffer fill is on a memory its unit can read.
   pm.addPass(createIndirectAddrBufFillLegalizationPass());
   pm.addPass(createScalarBroadcastLegalizationPass());
+  pm.addPass(createSplatLegalizationPass());
   pm.addPass(createNormalizeSCFForLoopsPass());
   // Canonicalize to get rid of intervening code and single iteration loops
   pm.addPass(mlir::createCanonicalizerPass());
@@ -129,6 +131,10 @@ void scheduler::buildSchedulerOptimizationPipeline(
   //  -> Apply patterns that add/remove allocations or coalesce FIFOs.
   pm.nest<mlir::ModuleOp>().addNestedPass<mlir::func::FuncOp>(
       createApplyDevicePatternsPass({"post_scheduling"}));
+  // A pattern above can only hand a buffer it materialized to a tensor-typed
+  // consumer as a tensor, so the consumer is rebuilt on buffers here, before
+  // addresses are assigned to the buffers themselves.
+  pm.addPass(createCustomLinalgBufferizationPass());
 
   pm.addPass(createAddressAssignmentPass(scheduler_ctx));
   // TODO: position of cross-instance parallelization is TBD

@@ -26,6 +26,7 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringExtras.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/IR/BuiltinAttributes.h>
@@ -68,8 +69,11 @@ namespace {
 struct LowerReadFromFifoPattern
     : public mlir::OpRewritePattern<mlir::ktdf::ReadFromFifoOp> {
   LowerReadFromFifoPattern(mlir::MLIRContext* context,
+                           const mlir::ktdf_arch::ResourceKinds& resource_kinds,
                            const ResourceToUnits& components)
-      : OpRewritePattern(context), components_(components) {}
+      : OpRewritePattern(context),
+        resource_kinds_(resource_kinds),
+        components_(components) {}
 
   mlir::LogicalResult matchAndRewrite(
       mlir::ktdf::ReadFromFifoOp read_op,
@@ -109,13 +113,72 @@ struct LowerReadFromFifoPattern
         rewriter, read_op.getLoc(), vector_type, queried_unit,
         /*dbgName=*/nullptr);
 
-    // Replace the read_from_fifo with the receive operation
-    rewriter.replaceOp(read_op, receive_op.getData());
+    // A read of a splat the load unit left half done owes the shuffle its mode
+    // names before anything may consume it.
+    mlir::Value received = receive_op.getData();
+    if (read_op.getSplat()) {
+      // FIXME: Discover compute from op.
+      auto compute = resource_kinds_.getDefaultCompute();
+      if (!compute) {
+        read_op.emitError(
+            "a sub-SIMD splat needs the device to declare a default compute "
+            "unit to read the sub-SIMD group width off");
+        return mlir::failure();
+      }
+      auto splatted = emitSplatMode(rewriter, read_op, *read_op.getSplat(),
+                                    received, compute);
+      if (mlir::failed(splatted)) {
+        return mlir::failure();
+      }
+      received = *splatted;
+    }
+
+    // Replace the read_from_fifo with the received vector.
+    rewriter.replaceOp(read_op, received);
 
     return mlir::success();
   }
 
  private:
+  /// Emit the shuffle `mode` names over `received`, and return its result.
+  ///
+  /// The width it works over is an arch fact, not the device file's to repeat:
+  /// a sub-SIMD group is as wide as the compute unit declares in
+  /// `ktdf_arch.feature.simd = { sub_simd_lanes = ... }`.
+  static mlir::FailureOr<mlir::Value> emitSplatMode(
+      mlir::PatternRewriter& rewriter, mlir::ktdf::ReadFromFifoOp read_op,
+      mlir::ktdf::SplatMode mode, mlir::Value received,
+      mlir::ktdf_arch::ExecutionUnitOp compute) {
+    auto vector_type = mlir::cast<mlir::VectorType>(received.getType());
+    switch (mode) {
+      case mlir::ktdf::SplatMode::FirstSubSimdLaneToEachSubSimd: {
+        const int64_t group =
+            compute.getFeature<mlir::ktdf_arch::feature::SIMD>()
+                .getSubSimdLanes(vector_type.getElementType());
+        if (group <= 0) {
+          return read_op.emitError(
+              "a sub-SIMD splat needs the compute unit to declare "
+              "ktdf_arch.feature.simd = { sub_simd_lanes = ... } for this "
+              "element type");
+        }
+        // Each sub-SIMD group splats its first element to all other lanes in
+        // the group. For this to be well-defined, every sub-SIMD group must
+        // have a first element — i.e. the data received through the FIFO
+        // (vector_type.getNumElements() lanes) must be evenly divisible by
+        // the sub-SIMD group width.
+        if (vector_type.getNumElements() % group != 0) {
+          return read_op.emitError("sub-SIMD group width ")
+                 << group << " does not divide the "
+                 << vector_type.getNumElements() << " lanes received";
+        }
+        return emitSubSimdSplatShuffle(rewriter, read_op.getLoc(), received,
+                                       group);
+      }
+    }
+    llvm_unreachable("unhandled ktdf::SplatMode");
+  }
+
+  const mlir::ktdf_arch::ResourceKinds& resource_kinds_;
   const ResourceToUnits& components_;
 };
 
@@ -569,6 +632,7 @@ struct LowerSignalPattern
 
 /// Lower a memref.copy that MapReductionPartials emitted.
 ///
+/// Lowers the copy to agen.vector_store of the source value into the dest.
 /// Two sources reach here. A fifo read is already a value, so it is stored
 /// straight into the destination:
 ///   %r  = ktdf.read_from_fifo ... -> memref<...>
@@ -581,7 +645,6 @@ struct LowerSignalPattern
 /// Runs at higher benefit (2) than FoldEmptyCopy (1, a canonicalization
 /// pattern) so it fires first, preventing FoldEmptyCopy from crashing on
 /// opaque memory-space attributes.
-/// Lowers the copy to agen.vector_store of the source value into the dest.
 struct LowerMemRefCopyFromFifoPattern
     : public mlir::OpRewritePattern<mlir::memref::CopyOp> {
   explicit LowerMemRefCopyFromFifoPattern(mlir::MLIRContext* context)
@@ -865,7 +928,8 @@ mlir::LogicalResult scheduler::runOperationLowerings(
   mlir::RewritePatternSet patterns(func.getContext());
   populateLinalgLoweringPatterns(patterns, symbols);
   patterns.add<LowerMemRefCopyFromFifoPattern>(func.getContext());
-  patterns.add<LowerReadFromFifoPattern>(func.getContext(), components);
+  patterns.add<LowerReadFromFifoPattern>(func.getContext(), mapping.byKind(),
+                                         components);
   patterns.add<LowerWriteToFifoPattern>(func.getContext(), components);
   populateDataTransferLoweringPatterns(patterns, components);
   patterns.add<LowerSignalPattern>(func.getContext(), scheduler_ctx,

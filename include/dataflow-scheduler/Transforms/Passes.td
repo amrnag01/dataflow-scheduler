@@ -354,6 +354,87 @@ def IndirectAddrBufFillLegalizationPass
   ];
 }
 
+def SplatLegalizationPass : Pass<"splat-legalization", "mlir::ModuleOp"> {
+  let summary = "Legalize splat data_transfer loads and name the shuffle that finishes them";
+  let description = [{
+    Runs after ScalarBroadcastLegalizationPass and records, in the IR, that a
+    splat the hardware cannot perform in one step has been left half done.
+
+    For each ktdf.data_transfer with transfer_mode="splat" whose destination is
+    a FIFO:
+
+      1. Validates that the load unit's SIMD feature declares the splat
+         capability.
+      2. Calls computeSplatGranularityElements to derive the effective load
+         width from the load unit's access_granularity arch attribute.
+      3. When that width exceeds the source element count -- when the hardware
+         really does have to load more than was asked for -- legalizes the
+         innermost static_source_sizes dimension to it.  The size operand
+         carries the load width, so no attribute is emitted for it.
+      4. In that same case, sets
+         splat = #ktdf.splat<first_subsimd_lane_to_each_subsimd> on each
+         consuming ktdf.read_from_fifo.
+
+    A legalized load splats the granule it read, not the single element: every
+    sub-SIMD group ends up holding one live element instead of the whole vector
+    holding one.  The splat mode says so, and names the shuffle that closes the
+    gap; it is the pass's durable output.
+
+    The shuffle itself is emitted by the lowering to DFIR, which reads the group
+    width off the compute unit's sub_simd_lanes.  What the buffer it works on is
+    and where it lives stays the device's to decide, in its
+    patterns ["post_scheduling"] block.  This pass queries the arch for the load
+    width and nothing else.
+  }];
+  let constructor = "::scheduler::createSplatLegalizationPass()";
+  let dependentDialects = [
+    "mlir::ktdf::KTDFDialect"
+  ];
+}
+
+def CustomLinalgBufferizationPass : Pass<"custom-linalg-bufferization", "mlir::ModuleOp"> {
+  let summary = "Absorb bufferization.to_tensor into its buffer-mode consumer";
+  let description = [{
+    Rebuilds every `linalg.generic` that reads a `bufferization.to_tensor` so it
+    operates on buffers, and drops the `to_tensor`.
+
+    A `to_tensor` is how a device pattern hands a buffer it materialized to a
+    consumer it cannot retype.  PDL replaces a value with one of the same type;
+    it cannot reach into that consumer to change its operand types or drop its
+    results.  So the pattern leaves a tensor view behind and this pass finishes
+    the job.
+
+    For each `bufferization.to_tensor` whose result feeds a `linalg.generic`:
+
+      1. Allocates a `memref.alloc` for each of the generic's tensor results,
+         in the memory local to the stage's unit -- naming the memory is what
+         lets AddressAssignmentPass place the buffer.
+      2. Re-emits every other tensor input as a memref-typed
+         `ktdf.read_from_fifo`.  A tensor input from anything else is an error:
+         there is no buffer to name for it.
+      3. Rebuilds the generic in buffer semantics -- same indexing maps, same
+         iterator types, same body, no results -- and re-points every consumer
+         of its results at the matching output buffer.
+      4. Erases the original generic, the `to_tensor`, and whatever they leave
+         dead.
+
+    Indexing maps are left alone.  The broadcast map a splat legalization
+    installed already reads the element the splat made uniform, so there is
+    nothing about the buffer that changes how the generic indexes it.
+
+    The pass is not specific to splats: any `to_tensor` whose uses can be
+    converted is absorbed.
+  }];
+  let constructor = "::scheduler::createCustomLinalgBufferizationPass()";
+
+  let dependentDialects = [
+    "mlir::bufferization::BufferizationDialect",
+    "mlir::ktdf::KTDFDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::memref::MemRefDialect"
+  ];
+}
+
 def EnsureDeviceDeclarationPass
     : Pass<"ensure-device-declaration", "mlir::ModuleOp"> {
   let summary = "Ensure that there is a ktdf_arch.device declaration";
@@ -437,11 +518,18 @@ def ApplyDevicePatternsPass : Pass<"apply-device-patterns", "mlir::func::FuncOp"
       "List of pattern groups to enable, or empty for ungrouped patterns only">
   ];
 
+  // Everything a device's patterns may name, plus what a device file itself
+  // parses as.  A pattern creating an op of an unloaded dialect is a hard
+  // error, and the device is imported while the pass is already running, so a
+  // dialect missing here takes the whole run down.
   let dependentDialects = [
     "mlir::agen::AgenDialect",
     "mlir::arith::ArithDialect",
+    "mlir::bufferization::BufferizationDialect",
     "mlir::func::FuncDialect",
+    "mlir::ktdf::KTDFDialect",
     "mlir::ktdf_arch::KTDFArchDialect",
+    "mlir::ktdp::KtdpDialect",
     "mlir::memref::MemRefDialect",
     "mlir::pdl::PDLDialect",
     "mlir::pdl_interp::PDLInterpDialect",
@@ -558,6 +646,30 @@ def IndirectAddrBufLegalizationPass
     No-op when no ktdp_lowering.construct_indirect_access_tile is present.
   }];
   let constructor = "::scheduler::createIndirectAddrBufLegalizationPass()";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::ktdf::KTDFDialect"
+  ];
+}
+
+def IndirectAccessLoopMaterializationPass
+    : Pass<"indirect-access-loop-materialization", "mlir::ModuleOp"> {
+  let summary = "Materialize loops for non-contiguous direct subscripts of "
+                "indirect access tiles";
+  let description = [{
+    Inspects the remaining direct-subscript intermediate variables of each
+    ktdp_lowering.construct_indirect_access_tile. A variable is materialized
+    into a scf.for loop when its dimension fails the dense-packing condition
+    (stride[k] != size[k+1]*stride[k+1], or stride != 1 for the innermost
+    dimension of $base) OR the full-coverage condition (variables_space_set
+    bound < dimension size). Variables that satisfy both conditions are
+    retained so that ConstructThreeStagePipeline can read the per-transfer
+    tile size. Materialized loops are annotated parallel_loop.
+    No-op when all remaining variables satisfy both conditions, or when no
+    ktdp_lowering.construct_indirect_access_tile is present.
+  }];
+  let constructor = "::scheduler::createIndirectAccessLoopMaterializationPass()";
   let dependentDialects = [
     "mlir::arith::ArithDialect",
     "mlir::scf::SCFDialect",
