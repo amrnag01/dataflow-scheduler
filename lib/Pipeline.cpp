@@ -164,6 +164,16 @@ void scheduler::buildKTDFLegalityPasses(
     mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
   pm.addPass(createKTIRLegalityCheckPass());
   pm.addPass(createComputeGroupExtractionPass());
+  pm.addPass(createIndirectComputeGroupSplitPass());
+  pm.addPass(createIndirectAddrBufLegalizationPass());
+  pm.addPass(createIndirectAccessLoopMaterializationPass());
+  {
+    auto& nested = pm.nest<mlir::ModuleOp>().nest<mlir::func::FuncOp>();
+    nested.addPass(mlir::createConvertElementwiseToLinalgPass());
+    nested.addPass(mlir::createLinalgMorphOpsPass(
+        {.categoryToGeneric = true, .namedToGeneric = true}));
+    nested.addPass(createFuseLinalgPass());
+  }
   pm.addPass(createConstructThreeStagePipelinePass(scheduler_ctx));
   pm.nest<mlir::ModuleOp>().nest<mlir::func::FuncOp>().addPass(
       createApplyDevicePatternsPass({"pre_scheduling"}));
