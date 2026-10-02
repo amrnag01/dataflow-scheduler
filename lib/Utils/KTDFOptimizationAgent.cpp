@@ -57,7 +57,6 @@ KTDFOptimizationAgent::KTDFOptimizationAgent(
 KTDFOptimizationAgent::~KTDFOptimizationAgent() = default;
 
 mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
-
   // Get IR string
   std::string ir_str;
   {
@@ -71,13 +70,8 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
   // Build initial user message with IR
   std::ostringstream initial_content;
   initial_content
-      << "KTDF IR to optimize:\n\n```mlir\n"
-      << ir_str << "\n```\n\n"
-      << "TASK (2 iterations):\n"
-      << "1. Iteration 1: Call evaluate_cost with the IR above to measure "
-         "baseline latency\n"
-      << "2. Iteration 2: Call submit_final_answer with optimized IR\n\n"
-      << "For this test, return the IR unchanged and explain what you measured.\n";
+      << "Optimize the following KTDF IR to minimize latency:\n\n```mlir\n"
+      << ir_str << "\n```\n";
 
   json messages = json::array();
   json user_msg;
@@ -229,31 +223,35 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
                 }
               }
 
-              if (!optimized_ir.empty()) {
-                // Write optimized IR to temp file
-                llvm::SmallString<128> temp_path;
-                std::error_code ec = llvm::sys::fs::createTemporaryFile(
-                    "ktdf-optimized", ".mlir", temp_path);
-                if (ec) {
-                  llvm::report_fatal_error(
-                      "[KTDFOptimizationAgent] FATAL: Failed to create temp file");
-                }
-
-                llvm::raw_fd_ostream temp_file(temp_path, ec);
-                if (ec) {
-                  llvm::report_fatal_error(
-                      "[KTDFOptimizationAgent] FATAL: Failed to open temp file");
-                }
-
-                temp_file << optimized_ir;
-                temp_file.close();
-
-                // Store temp file path for pass to read
-                optimized_ir_path_ = temp_path.str().str();
-                return module;
+              if (optimized_ir.empty()) {
+                llvm::report_fatal_error(
+                    "[KTDFOptimizationAgent] FATAL: submit_final_answer called "
+                    "without optimized_ir. Agent must provide IR.");
               }
 
-              // Fallback: return original module
+              llvm::errs() << "[Agent] Optimized IR:\n" << optimized_ir << "\n";
+
+              // Write optimized IR to temp file
+              llvm::SmallString<128> temp_path;
+              std::error_code ec = llvm::sys::fs::createTemporaryFile(
+                  "ktdf-optimized", ".mlir", temp_path);
+              if (ec) {
+                llvm::report_fatal_error(
+                    "[KTDFOptimizationAgent] FATAL: Failed to create temp "
+                    "file");
+              }
+
+              llvm::raw_fd_ostream temp_file(temp_path, ec);
+              if (ec) {
+                llvm::report_fatal_error(
+                    "[KTDFOptimizationAgent] FATAL: Failed to open temp file");
+              }
+
+              temp_file << optimized_ir;
+              temp_file.close();
+
+              // Store temp file path for pass to read
+              optimized_ir_path_ = temp_path.str().str();
               return module;
             } else if (tool_name == "evaluate_cost" && !handled_tool) {
               handled_tool = true;
@@ -267,7 +265,8 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
               auto eval_result = evaluateCost(ir_param);
 
               if (eval_result.success) {
-                llvm::errs() << "[Agent] Latency: " << eval_result.latency << " sec\n";
+                llvm::errs()
+                    << "[Agent] Latency: " << eval_result.latency << " sec\n";
               }
 
               // Add assistant message to history
@@ -294,18 +293,12 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
               user_response["content"] = user_content;
               messages.push_back(user_response);
 
-              // Add explicit reminder to call submit_final_answer with all
-              // fields
+              // Add explicit reminder to continue optimizations
               json reminder;
               reminder["role"] = "user";
-              std::ostringstream reminder_content;
-              reminder_content
-                  << "Now call submit_final_answer with:\n"
-                  << "1. optimized_ir: the complete MLIR module (for this "
-                     "test, return the IR unchanged)\n"
-                  << "2. explanation: what optimizations were attempted\n"
-                  << "Remember: Both fields are REQUIRED.\n";
-              reminder["content"] = reminder_content.str();
+              reminder["content"] =
+                  "Continue exploring optimizations. When satisfied, call "
+                  "submit_final_answer with optimized_ir and explanation.";
               messages.push_back(reminder);
 
               // Continue to next iteration of while loop
@@ -386,17 +379,41 @@ std::string KTDFOptimizationAgent::buildSystemPrompt() {
   ss << "1. evaluate_cost: Takes IR string and reasoning, returns latency in "
         "seconds from SAMM cost model\n";
   ss << "2. submit_final_answer: Returns optimized IR and explanation\n\n";
-  ss << "CRITICAL - REQUIRED TOOL BEHAVIOR:\n";
-  ss << "First iteration:\n";
-  ss << "  - Call evaluate_cost with the UNCHANGED original IR to get baseline "
-        "latency\n";
-  ss << "  - Both 'ir' and 'reasoning' fields are REQUIRED\n\n";
-  ss << "Second iteration:\n";
-  ss << "  - Call submit_final_answer with:\n";
-  ss << "    1. optimized_ir: The COMPLETE MLIR module (for now, unchanged)\n";
-  ss << "    2. explanation: What you attempted\n\n";
-  ss << "Your task: Optimize the given KTDF IR to minimize latency while "
-        "maintaining functional correctness.\n";
+  ss << "OPTIMIZATION SKILLS:\n";
+  ss << "Read the following optimization techniques and use them to guide your "
+        "exploration:\n\n";
+
+  // Read skills.md
+  std::ifstream skills_file("skills.md");
+  if (skills_file.is_open()) {
+    std::string skills_content((std::istreambuf_iterator<char>(skills_file)),
+                               std::istreambuf_iterator<char>());
+    ss << skills_content << "\n\n";
+    skills_file.close();
+  }
+
+  ss << "TASK:\n";
+  ss << "1. Call evaluate_cost with the original IR to establish baseline "
+        "latency. In your reasoning, explain:\n";
+  ss << "   - What compute operations are in the IR\n";
+  ss << "   - What data transfers occur\n";
+  ss << "   - What compute units are being used\n";
+  ss << "   - What the pipeline is doing\n";
+  ss << "2. Explore optimizations from the skills above by modifying the IR\n";
+  ss << "3. For each modification, call evaluate_cost with reasoning that "
+        "explains which technique from skills.md is being applied. CRITICAL: "
+        "Do not call evaluate_cost with illegal IRs, it will crash! All IRs "
+        "passed to the evaluate_cost tool must be legal and iso-functional "
+        "with the original IR!\n";
+  ss << "4. CONSTRAINT: Only try optimizations listed in the OPTIMIZATION "
+        "SKILLS above.\n";
+  ss << "   If you have other optimization ideas (including variants or "
+        "extensions of ideas listed), include them in your final "
+        "explanation but do NOT attempt to implement them.\n";
+  ss << "5. When all optimizations in OPTIMIZATION SKILLS have been explored, "
+        "call "
+        "submit_final_answer with the best optimized IR (lowest latency).\n";
+  ss << "6. Both optimized_ir and explanation fields are REQUIRED\n";
   return ss.str();
 }
 
@@ -457,7 +474,8 @@ KTDFOptimizationAgent::CostEvaluation KTDFOptimizationAgent::evaluateCost(
   std::error_code ec =
       llvm::sys::fs::createTemporaryFile("ktdf_eval", ".mlir", temp_file);
   if (ec) {
-    llvm::report_fatal_error("[KTDFOptimizationAgent] Failed to create temp file");
+    llvm::report_fatal_error(
+        "[KTDFOptimizationAgent] Failed to create temp file");
   }
 
   std::ofstream f(temp_file.c_str());
