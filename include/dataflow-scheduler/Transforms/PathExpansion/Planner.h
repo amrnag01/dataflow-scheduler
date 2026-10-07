@@ -224,15 +224,6 @@ struct PathExpansionPlan {
 };
 
 //===----------------------------------------------------------------------===//
-// Stage DAG Validation Functions
-//===----------------------------------------------------------------------===//
-
-/// Validate that the stage topology is a single linear chain
-/// Returns failure if the DAG has branches or multiple paths
-mlir::LogicalResult validateLinearChain(
-    llvm::ArrayRef<StageNode*> sorted_stages);
-
-//===----------------------------------------------------------------------===//
 // Planning Functions
 //===----------------------------------------------------------------------===//
 

@@ -26,10 +26,12 @@
 // CHECK-NEXT:   func.func(
 // CHECK-NEXT:   convert-elementwise-to-linalg,
 // CHECK-NEXT:   linalg-morph-ops{category-to-generic=true generic-to-named=false named-to-category=false named-to-generic=true},
-// CHECK-NEXT:   fuse-linalg
+// CHECK-NEXT:   fuse-linalg,
+// CHECK-NEXT:   ktir-map-and-tile,
+// CHECK-NEXT:   ktir-bufferize,
+// CHECK-NEXT:   ktir-pipeline
 // CHECK-NEXT:   )
 // CHECK-NEXT:   )
-// CHECK-NEXT:   construct-three-stage-pipeline
 // CHECK-NEXT:   builtin.module(
 // CHECK-NEXT:   func.func(
 // CHECK-NEXT:   apply-device-patterns{groups={pre_scheduling}}
@@ -43,6 +45,7 @@
 // CHECK-NEXT:   hoist-constant-storage
 // CHECK-NEXT:   )
 // CHECK-NEXT:   )
+// CHECK-NEXT:   fold-fifo-relay-stages
 // CHECK-NEXT:   path-expansion
 // CHECK-NEXT:   indirect-addr-buf-fill-legalization
 // CHECK-NEXT:   scalar-broadcast-legalization

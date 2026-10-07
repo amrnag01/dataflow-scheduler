@@ -1,9 +1,11 @@
 add_dataflow_scheduler_library(DataflowSchedulerKTIRToScheduleIR
     ComputeGroupExtraction.cpp
-    ConstructThreeStagePipeline.cpp
     FuseLinalg.cpp
     IndirectComputeGroupSplit.cpp
+    KTIRBufferize.cpp
     KTIRLegalityCheck.cpp
+    KTIRMapAndTile.cpp
+    KTIRPipeline.cpp
 
   ADDITIONAL_HEADER_DIRS
     ${DataflowScheduler_SOURCE_DIR}/include/dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR

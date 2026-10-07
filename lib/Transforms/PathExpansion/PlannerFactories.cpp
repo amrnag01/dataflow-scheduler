@@ -242,6 +242,32 @@ TransferMaterializationInfo* TransferInfoFactory::createFromTemplateWithBuffer(
   return result;
 }
 
+TransferMaterializationInfo* TransferInfoFactory::createFromTemplate(
+    mlir::Operation* template_op,
+    const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,
+    ResourceType source_resource, ResourceType dest_resource) {
+  assert(mlir::isa<mlir::ktdf::DataTransferOp>(template_op) &&
+         "template_op must be a DataTransferOp");
+
+  auto sides = extractTemplateSides(template_op);
+
+  auto transfer = std::make_unique<TransferMaterializationInfo>();
+  transfer->template_op = template_op;
+  transfer->hop = edge;
+  transfer->source_resource = source_resource;
+  transfer->dest_resource = dest_resource;
+  transfer->source_indices = sides.src_indices;
+  transfer->source_sizes = sides.src_sizes;
+  transfer->source_map = sides.src_map;
+  transfer->dest_indices = sides.dst_indices;
+  transfer->dest_sizes = sides.dst_sizes;
+  transfer->dest_map = sides.dst_map;
+
+  TransferMaterializationInfo* result = transfer.get();
+  transfers_.push_back(std::move(transfer));
+  return result;
+}
+
 TransferMaterializationInfo* TransferInfoFactory::createFromFifoOp(
     mlir::Operation* fifo_op,
     const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,

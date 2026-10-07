@@ -259,4 +259,150 @@ def KTDPLowering_ConstructMemoryViewOp :
   let hasVerifier = 1;
 }
 
+//===----------------------------------------------------------------------===//
+// Load & Store
+//===----------------------------------------------------------------------===//
+
+def KTDPLowering_LoadOp : KTDPLowering_Op<"load", [
+    AttrSizedOperandSegments, 
+    OffsetSizeAndStrideOpInterface,
+    MemoryEffectsOpInterface]> {
+  let summary = "Lowering phase variant of `ktdp.load` that is bufferizable";
+  let description = [{
+    The `ktdp_lowering.load` op captures the semantics of a `ktdp.load` op plus
+    an optional sequence of `tensor.extract_slice` operations. It can take both
+    an `!ktdp.access_tile` as well as a `memref` as a source operand.
+  }];
+
+  let arguments = (ins
+    Arg<
+      AnyTypeOf<[AnyMemRef, Ktdp_AccessTileType], "", "::mlir::ShapedType">, 
+      "", 
+      [MemRead]>:$source,
+    Variadic<Index>:$offsets,
+    Variadic<Index>:$sizes,
+    Variadic<Index>:$strides,
+    DenseI64ArrayAttr:$static_offsets,
+    DenseI64ArrayAttr:$static_sizes,
+    DenseI64ArrayAttr:$static_strides
+  );
+  let results = (outs AnyRankedTensor:$result);
+
+  let assemblyFormat = [{
+    $source ``
+    custom<DynamicIndexList>($offsets, $static_offsets)
+    custom<DynamicIndexList>($sizes, $static_sizes)
+    custom<DynamicIndexList>($strides, $static_strides)
+    attr-dict `:` type($source) `->` type($result)
+  }];
+
+  let hasVerifier = 1;
+
+  let builders = [
+    OpBuilder<(ins 
+      "RankedTensorType":$result_type, 
+      "Value":$source, 
+      "ArrayRef<OpFoldResult>":$mixed_offsets, 
+      "ArrayRef<OpFoldResult>":$mixed_sizes,
+      "ArrayRef<OpFoldResult>":$mixed_strides)>,
+    OpBuilder<(ins 
+      "RankedTensorType":$result_type, 
+      "Value":$source, 
+      "OffsetSizeAndStrideOpInterface":$slice)>,
+    OpBuilder<(ins
+      "RankedTensorType":$result_type,
+      "Value":$source,
+      "ValueRange":$sizes,
+      "ArrayRef<int64_t>":$static_sizes)>,
+    OpBuilder<(ins
+      "RankedTensorType":$result_type,
+      "Value":$source,
+      "ArrayRef<OpFoldResult>":$mixed_sizes)>
+  ];
+
+  let extraClassDeclaration = [{
+    //===------------------------------------------------------------------===//
+    // OffsetSizeAndStrideOpInterface
+    //===------------------------------------------------------------------===//
+
+    auto getArrayAttrMaxRanks() -> std::array<unsigned, 3> {
+      unsigned rank = getSource().getType().getRank();
+      return {rank, rank, rank};
+    }
+    
+    static unsigned getOffsetSizeAndStrideStartOperandIndex() { return 1; }
+  }];
+}
+
+def KTDPLowering_StoreOp : KTDPLowering_Op<"store", [
+    AttrSizedOperandSegments, 
+    OffsetSizeAndStrideOpInterface,
+    MemoryEffectsOpInterface]> {
+  let summary = "Lowering phase variant of `ktdp.store` that is bufferizable";
+  let description = [{
+    The `ktdp_lowering.store` op captures the semantics of a `ktdp.store` op plus
+    an optional sequence of `tensor.insert_slice` operations. It can take both
+    an `!ktdp.access_tile` as well as a `memref` as a dest operand.
+  }];
+
+  let arguments = (ins
+    AnyRankedTensor:$source,
+    Arg<
+      AnyTypeOf<[AnyMemRef, Ktdp_AccessTileType], "", "::mlir::ShapedType">,
+      "",
+      [MemWrite]>:$dest,
+    Variadic<Index>:$offsets,
+    Variadic<Index>:$sizes,
+    Variadic<Index>:$strides,
+    DenseI64ArrayAttr:$static_offsets,
+    DenseI64ArrayAttr:$static_sizes,
+    DenseI64ArrayAttr:$static_strides
+  );
+
+  let assemblyFormat = [{
+    $source `into` $dest ``
+    custom<DynamicIndexList>($offsets, $static_offsets)
+    custom<DynamicIndexList>($sizes, $static_sizes)
+    custom<DynamicIndexList>($strides, $static_strides)
+    attr-dict `:` type($source) `into` type($dest)
+  }];
+
+  let hasVerifier = 1;
+
+  let builders = [
+    OpBuilder<(ins 
+      "Value":$source, 
+      "Value":$dest, 
+      "ArrayRef<OpFoldResult>":$mixed_offsets, 
+      "ArrayRef<OpFoldResult>":$mixed_sizes,
+      "ArrayRef<OpFoldResult>":$mixed_strides)>,
+    OpBuilder<(ins 
+      "Value":$source,
+      "Value":$dest, 
+      "OffsetSizeAndStrideOpInterface":$slice)>,
+    OpBuilder<(ins
+      "Value":$source,
+      "Value":$dest,
+      "ValueRange":$sizes,
+      "ArrayRef<int64_t>":$static_sizes)>,
+    OpBuilder<(ins
+      "Value":$source,
+      "Value":$dest,
+      "ArrayRef<OpFoldResult>":$mixed_sizes)>
+  ];
+
+  let extraClassDeclaration = [{
+    //===------------------------------------------------------------------===//
+    // OffsetSizeAndStrideOpInterface
+    //===------------------------------------------------------------------===//
+
+    auto getArrayAttrMaxRanks() -> std::array<unsigned, 3> {
+      unsigned rank = getSource().getType().getRank();
+      return {rank, rank, rank};
+    }
+    
+    static unsigned getOffsetSizeAndStrideStartOperandIndex() { return 2; }
+  }];
+}
+
 #endif // DATAFLOW_SCHEDULER_DIALECT_KTDPLOWERING_KTDPLOWERING_TD

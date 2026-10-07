@@ -177,7 +177,7 @@ mlir::LogicalResult PathExpansionPass::processPipeline(
   }
 
   mlir::IRRewriter rewriter(new_pipeline);
-  mlir::ktdf::PipelinePrivatizer::canonicalize(rewriter, new_pipeline);
+  mlir::ktdf::PrivateBuilder::canonicalize(rewriter, new_pipeline);
 
   // Erase the original pipeline
   pipeline_op.erase();

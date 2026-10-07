@@ -22,12 +22,20 @@
 
 // clang-format off
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
+#include "ktir/Dialect/KTDP/KTDPTypes.h"
 // clang-format on
 
 #include <llvm/ADT/SetVector.h>
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/ADT/TypeSwitch.h>
+#include <llvm/Support/LogicalResult.h>
+#include <mlir/Dialect/Utils/StaticValueUtils.h>
 #include <mlir/IR/Builders.h>
+#include <mlir/IR/Diagnostics.h>
 #include <mlir/IR/DialectImplementation.h>
+#include <mlir/IR/OpDefinition.h>
 #include <mlir/IR/OpImplementation.h>
+#include <mlir/Interfaces/SideEffectInterfaces.h>
 #include <mlir/Interfaces/ViewLikeInterface.h>
 
 using namespace mlir;
@@ -455,3 +463,123 @@ LogicalResult ConstructMemoryViewOp::verify() {
 //===----------------------------------------------------------------------===//
 
 mlir::Value ConstructMemoryViewOp::getViewSource() { return getOffset(); }
+
+//===----------------------------------------------------------------------===//
+// LoadOp
+//===----------------------------------------------------------------------===//
+
+auto LoadOp::verify() -> LogicalResult {
+  // NOTE: OffsetSizeAndStrideOpInterface verifies the ranks and operands.
+  if (getStaticSizes() != getType().getShape()) {
+    return emitOpError("static sizes ")
+           << "[" << getStaticSizes() << "] do not match result shape ["
+           << getType().getShape() << "]";
+  }
+
+  // NOTE: Access tiles do not have a data element type.
+  if (const auto type = dyn_cast<MemRefType>(getSource().getType());
+      type && type.getElementType() != getType().getElementType()) {
+    return emitOpError("source element type ")
+           << type.getElementType() << " does not match result element type "
+           << getType().getElementType();
+  }
+
+  return success();
+}
+
+void LoadOp::build(OpBuilder& builder, OperationState& state,
+                   RankedTensorType result_type, Value source,
+                   ArrayRef<OpFoldResult> mixed_offsets,
+                   ArrayRef<OpFoldResult> mixed_sizes,
+                   ArrayRef<OpFoldResult> mixed_strides) {
+  const auto [static_offsets, offsets] = decomposeMixedValues(mixed_offsets);
+  const auto [static_sizes, sizes] = decomposeMixedValues(mixed_sizes);
+  const auto [static_strides, strides] = decomposeMixedValues(mixed_strides);
+  build(builder, state, result_type, source, offsets, sizes, strides,
+        static_offsets, static_sizes, static_strides);
+}
+
+void LoadOp::build(OpBuilder& builder, OperationState& state,
+                   RankedTensorType result_type, Value source,
+                   OffsetSizeAndStrideOpInterface slice) {
+  build(builder, state, result_type, source, slice.getOffsets(),
+        slice.getSizes(), slice.getStrides(), slice.getStaticOffsets(),
+        slice.getStaticSizes(), slice.getStaticStrides());
+}
+
+void LoadOp::build(OpBuilder& builder, OperationState& state,
+                   RankedTensorType result_type, Value source, ValueRange sizes,
+                   ArrayRef<int64_t> static_sizes) {
+  const SmallVector<int64_t> static_offsets(result_type.getRank(), 0);
+  const SmallVector<int64_t> static_strides(result_type.getRank(), 1);
+
+  build(builder, state, result_type, source, {}, sizes, {}, static_offsets,
+        static_sizes, static_strides);
+}
+
+void LoadOp::build(OpBuilder& builder, OperationState& state,
+                   RankedTensorType result_type, Value source,
+                   ArrayRef<OpFoldResult> mixed_sizes) {
+  const auto [static_sizes, sizes] = decomposeMixedValues(mixed_sizes);
+
+  build(builder, state, result_type, source, sizes, static_sizes);
+}
+
+//===----------------------------------------------------------------------===//
+// StoreOp
+//===----------------------------------------------------------------------===//
+
+auto StoreOp::verify() -> LogicalResult {
+  // NOTE: OffsetSizeAndStrideOpInterface verifies the ranks and operands.
+  if (getStaticSizes() != getSource().getType().getShape()) {
+    return emitOpError("source shape ")
+           << "[" << getSource().getType().getShape()
+           << "] does not match static sizes [" << getStaticSizes() << "]";
+  }
+
+  // NOTE: Access tiles do not have a data element type.
+  if (const auto type = dyn_cast<MemRefType>(getDest().getType());
+      type && getSource().getType().getElementType() != type.getElementType()) {
+    return emitOpError("source element type ")
+           << getSource().getType().getElementType()
+           << " does not match dest element type " << type.getElementType();
+  }
+
+  return success();
+}
+
+void StoreOp::build(OpBuilder& builder, OperationState& state, Value source,
+                    Value dest, ArrayRef<OpFoldResult> mixed_offsets,
+                    ArrayRef<OpFoldResult> mixed_sizes,
+                    ArrayRef<OpFoldResult> mixed_strides) {
+  const auto [static_offsets, offsets] = decomposeMixedValues(mixed_offsets);
+  const auto [static_sizes, sizes] = decomposeMixedValues(mixed_sizes);
+  const auto [static_strides, strides] = decomposeMixedValues(mixed_strides);
+  build(builder, state, source, dest, offsets, sizes, strides, static_offsets,
+        static_sizes, static_strides);
+}
+
+void StoreOp::build(OpBuilder& builder, OperationState& state, Value source,
+                    Value dest, OffsetSizeAndStrideOpInterface slice) {
+  build(builder, state, source, dest, slice.getOffsets(), slice.getSizes(),
+        slice.getStrides(), slice.getStaticOffsets(), slice.getStaticSizes(),
+        slice.getStaticStrides());
+}
+
+void StoreOp::build(OpBuilder& builder, OperationState& state, Value source,
+                    Value dest, ValueRange sizes,
+                    ArrayRef<int64_t> static_sizes) {
+  const auto type = cast<RankedTensorType>(source.getType());
+  const SmallVector<int64_t> static_offsets(type.getRank(), 0);
+  const SmallVector<int64_t> static_strides(type.getRank(), 1);
+
+  build(builder, state, source, dest, {}, sizes, {}, static_offsets,
+        static_sizes, static_strides);
+}
+
+void StoreOp::build(OpBuilder& builder, OperationState& state, Value source,
+                    Value dest, ArrayRef<OpFoldResult> mixed_sizes) {
+  const auto [static_sizes, sizes] = decomposeMixedValues(mixed_sizes);
+
+  build(builder, state, source, dest, sizes, static_sizes);
+}
