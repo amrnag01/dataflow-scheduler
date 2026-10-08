@@ -92,7 +92,9 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
 
   while (iteration < max_iterations) {
     iteration++;
-    llvm::errs() << "[Agent] Iteration " << iteration << "\n";
+    if (debug_) {
+      llvm::errs() << "[Agent] Iteration " << iteration << "\n";
+    }
 
     // Build request
     json request_body;
@@ -179,7 +181,9 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
             // Skip thinking blocks
           } else if (block_type == "tool_use") {
             std::string tool_name = block["name"];
-            llvm::errs() << "[Agent] Tool: " << tool_name << "\n";
+            if (debug_) {
+              llvm::errs() << "[Agent] Tool: " << tool_name << "\n";
+            }
 
             json tool_use_content;
             tool_use_content["type"] = "tool_use";
@@ -195,7 +199,9 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
               std::string explanation;
               if (input.contains("explanation")) {
                 explanation = input["explanation"].get<std::string>();
-                llvm::errs() << "[Agent] Explanation: " << explanation << "\n";
+                if (debug_) {
+                  llvm::errs() << "[Agent] Explanation: " << explanation << "\n";
+                }
               }
 
               std::string optimized_ir;
@@ -236,7 +242,9 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
                     "without optimized_ir. Agent must provide IR.");
               }
 
-              llvm::errs() << "[Agent] Optimized IR:\n" << optimized_ir << "\n";
+              if (debug_) {
+                llvm::errs() << "[Agent] Optimized IR:\n" << optimized_ir << "\n";
+              }
 
               // Write optimized IR to temp file
               llvm::SmallString<128> temp_path;
@@ -267,11 +275,24 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
               std::string ir_param = input["ir"].get<std::string>();
               std::string reasoning = input["reasoning"].get<std::string>();
 
-              llvm::errs() << "[Agent] Reasoning: " << reasoning << "\n";
+              if (debug_) {
+                llvm::errs() << "[Agent] Reasoning: " << reasoning << "\n";
+              }
+
+              // Write IR to debug/
+              if (debug_) {
+                std::string debug_file = "debug/IR_iter_" + std::to_string(iteration) + ".mlir";
+                std::error_code ec;
+                llvm::raw_fd_ostream debug_os(debug_file, ec);
+                if (!ec) {
+                  debug_os << ir_param;
+                  debug_os.close();
+                }
+              }
 
               auto eval_result = evaluateCost(ir_param, iteration);
 
-              if (eval_result.success) {
+              if (eval_result.success && debug_) {
                 llvm::errs()
                     << "[Agent] Latency: " << eval_result.latency << " sec\n";
               }

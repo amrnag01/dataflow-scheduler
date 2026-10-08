@@ -62,6 +62,7 @@ private:
   std::string buildSystemPrompt();
   std::string buildToolSchemas();
 
+
   CostEvaluation evaluateCost(const std::string& ir_str, int iteration = 0);
 };
 

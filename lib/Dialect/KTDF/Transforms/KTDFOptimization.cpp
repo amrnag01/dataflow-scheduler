@@ -59,26 +59,39 @@ struct KTDFOptimizationPass
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
-    llvm::errs() << "[KTDFOptimization] Running optimization\n";
 
     std::string api_key = anthropicApiKey;
 
     // If no API key from pass option, try to get from context
+    bool debug = false;
     if (api_key.empty() && scheduler_ctx && !scheduler_ctx->isDummy()) {
       auto agent_ctx = static_cast<const scheduler::AgentDrivenSchedulerContext*>(scheduler_ctx);
       api_key = agent_ctx->api_key;
+      debug = agent_ctx->debug;
+    }
+
+    if (debug) {
+      llvm::errs() << "[KTDFOptimization] Running optimization\n";
     }
 
     if (api_key.empty()) {
-      llvm::errs() << "[KTDFOptimization] No API key provided, skipping agent "
-                      "call\n";
+      if (debug) {
+        llvm::errs() << "[KTDFOptimization] No API key provided, skipping agent "
+                        "call\n";
+      }
       return;
+    }
+
+    // Print original IR if debug is enabled
+    if (debug) {
+      llvm::errs() << "[KTDFOptimization] Original IR:\n";
+      module.print(llvm::errs());
+      llvm::errs() << "\n";
     }
 
     // Get context paths and debug flag
     std::string ktdf_bindings_dir;
     std::string cost_model_path;
-    bool debug = false;
     if (scheduler_ctx && !scheduler_ctx->isDummy()) {
       auto agent_ctx = static_cast<const scheduler::AgentDrivenSchedulerContext*>(scheduler_ctx);
       ktdf_bindings_dir = agent_ctx->ktdf_bindings_dir;
