@@ -133,27 +133,27 @@ auto reductionKindOf(mlir::Value yielded) -> llvm::StringRef {
   return "absmax";
 }
 
-// Rewrite helper: ktdf.with_precision(op, params) → DictionaryAttr
+// Rewrite helper: ktdf.template_for_precision(op, name) → StringAttr
 //
 // Expected `values` entries, two of them in this order:
 //   [0] mlir::Operation*  — the op whose accumulator gives the element type
-//   [1] mlir::Attribute   — the DictionaryAttr to add the precision to
+//   [1] mlir::Attribute   — a StringAttr naming the template, less the width
 //
-// Adds to those parameters the precision a template's `mode` field takes, read
-// off the element type the op accumulates in, and leaves the rest of them
-// alone. Fails for a type no template names, so the compute is left as it is
-// rather than lowered at the wrong width.
-auto ktdfWithPrecision(mlir::PatternRewriter& rewriter,
-                       mlir::PDLResultList& results,
-                       llvm::ArrayRef<mlir::PDLValue> values)
+// Returns `name` with the precision of the element type the op accumulates in
+// appended, "_fp16" or "_fp32", as the templates written for each width are
+// named. Fails for a type no template is written for, so the compute is left as
+// it is rather than lowered at the wrong width.
+auto ktdfTemplateForPrecision(mlir::PatternRewriter& rewriter,
+                              mlir::PDLResultList& results,
+                              llvm::ArrayRef<mlir::PDLValue> values)
     -> mlir::LogicalResult {
   assert(values.size() == 2);
   auto written = llvm::dyn_cast_if_present<mlir::DestinationStyleOpInterface>(
       values[0].cast<mlir::Operation*>());
   if (!written || written.getDpsInits().empty()) return mlir::failure();
-  auto params = llvm::dyn_cast_if_present<mlir::DictionaryAttr>(
+  auto name = llvm::dyn_cast_if_present<mlir::StringAttr>(
       values[1].cast<mlir::Attribute>());
-  if (!params) return mlir::failure();
+  if (!name) return mlir::failure();
 
   auto accumulator =
       llvm::dyn_cast<mlir::ShapedType>(written.getDpsInits().front().getType());
@@ -162,16 +162,14 @@ auto ktdfWithPrecision(mlir::PatternRewriter& rewriter,
   const mlir::Type element = accumulator.getElementType();
   llvm::StringRef precision;
   if (element.isF16()) {
-    precision = "fp16";
+    precision = "_fp16";
   } else if (element.isF32()) {
-    precision = "fp32";
+    precision = "_fp32";
   } else {
     return mlir::failure();
   }
 
-  mlir::NamedAttrList named(params);
-  named.set("prec", rewriter.getStringAttr(precision));
-  results.push_back(named.getDictionary(rewriter.getContext()));
+  results.push_back(rewriter.getStringAttr(name.getValue() + precision));
   return mlir::success();
 }
 
@@ -296,7 +294,8 @@ class PatternCache : public mlir::ktdf_arch::PatternCache {
     patterns.registerRewriteFunction("ktdf.memref_type_in_space",
                                      ktdfMemRefTypeInSpace);
     patterns.registerRewriteFunction("ktdf.subview_source", ktdfSubviewSource);
-    patterns.registerRewriteFunction("ktdf.with_precision", ktdfWithPrecision);
+    patterns.registerRewriteFunction("ktdf.template_for_precision",
+                                     ktdfTemplateForPrecision);
   }
 
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PatternCache)
