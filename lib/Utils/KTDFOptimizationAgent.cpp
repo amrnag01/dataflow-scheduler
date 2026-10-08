@@ -49,10 +49,17 @@ static size_t WriteCallback(void* contents, size_t size, size_t nmemb,
 
 KTDFOptimizationAgent::KTDFOptimizationAgent(
     const std::string& api_key, const std::string& ktdf_bindings_dir,
-    const std::string& cost_model_path)
+    const std::string& cost_model_path, bool debug)
     : api_key_(api_key),
       ktdf_bindings_dir_(ktdf_bindings_dir),
-      cost_model_path_(cost_model_path) {}
+      cost_model_path_(cost_model_path),
+      debug_(debug) {
+  // Set up debug folder if debug flag is set
+  if (debug_) {
+    llvm::sys::fs::remove_directories("debug");
+    llvm::sys::fs::create_directories("debug");
+  }
+}
 
 KTDFOptimizationAgent::~KTDFOptimizationAgent() = default;
 
@@ -262,7 +269,7 @@ mlir::ModuleOp KTDFOptimizationAgent::optimizeKTDF(mlir::ModuleOp module) {
 
               llvm::errs() << "[Agent] Reasoning: " << reasoning << "\n";
 
-              auto eval_result = evaluateCost(ir_param);
+              auto eval_result = evaluateCost(ir_param, iteration);
 
               if (eval_result.success) {
                 llvm::errs()
@@ -461,12 +468,21 @@ std::string KTDFOptimizationAgent::buildToolSchemas() {
 }
 
 KTDFOptimizationAgent::CostEvaluation KTDFOptimizationAgent::evaluateCost(
-    const std::string& ir_str) {
+    const std::string& ir_str, int iteration) {
   // Validate that cost model paths are set
   if (cost_model_path_.empty() || ktdf_bindings_dir_.empty()) {
     llvm::report_fatal_error(
         "[KTDFOptimizationAgent] cost_model_path and ktdf_bindings_dir must be "
         "provided via CLI flags");
+  }
+
+  // Debug: dump IR if flag is set
+  if (debug_) {
+    std::ostringstream filename;
+    filename << "debug/IR_iter_" << iteration << ".mlir";
+    std::ofstream debug_file(filename.str());
+    debug_file << ir_str;
+    debug_file.close();
   }
 
   // Write IR to temp file

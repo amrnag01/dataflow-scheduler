@@ -33,7 +33,8 @@ public:
   explicit KTDFOptimizationAgent(
       const std::string& api_key,
       const std::string& ktdf_bindings_dir,
-      const std::string& cost_model_path);
+      const std::string& cost_model_path,
+      bool debug = false);
   ~KTDFOptimizationAgent();
 
   /// Optimize the given module. Returns the optimized ModuleOp from the agent.
@@ -47,6 +48,7 @@ private:
   std::string ktdf_bindings_dir_;
   std::string cost_model_path_;
   std::string optimized_ir_path_;
+  bool debug_;
 
   struct CostEvaluation {
     bool success;
@@ -60,7 +62,7 @@ private:
   std::string buildSystemPrompt();
   std::string buildToolSchemas();
 
-  CostEvaluation evaluateCost(const std::string& ir_str);
+  CostEvaluation evaluateCost(const std::string& ir_str, int iteration = 0);
 };
 
 }  // namespace scheduler

@@ -75,17 +75,19 @@ struct KTDFOptimizationPass
       return;
     }
 
-    // Get context paths
+    // Get context paths and debug flag
     std::string ktdf_bindings_dir;
     std::string cost_model_path;
+    bool debug = false;
     if (scheduler_ctx && !scheduler_ctx->isDummy()) {
       auto agent_ctx = static_cast<const scheduler::AgentDrivenSchedulerContext*>(scheduler_ctx);
       ktdf_bindings_dir = agent_ctx->ktdf_bindings_dir;
       cost_model_path = agent_ctx->cost_model_path;
+      debug = agent_ctx->debug;
     }
 
     auto agent = std::make_unique<scheduler::KTDFOptimizationAgent>(
-        api_key, ktdf_bindings_dir, cost_model_path);
+        api_key, ktdf_bindings_dir, cost_model_path, debug);
     agent->optimizeKTDF(module);
 
     // Check if agent wrote optimized IR to a temp file
