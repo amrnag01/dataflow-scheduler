@@ -1,4 +1,5 @@
 add_dataflow_scheduler_library(DataflowSchedulerKTDFUtils
+    DataTransfers.cpp
     Utils.cpp
   
   ADDITIONAL_HEADER_DIRS
@@ -16,4 +17,5 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFUtils
   LINK_MLIR_LIBS
     MLIRLinalgDialect
     MLIRMemRefDialect
+    MLIRTensorDialect
 )

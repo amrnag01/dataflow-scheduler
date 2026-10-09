@@ -36,6 +36,7 @@
 #include <mlir/IR/Verifier.h>
 #include <mlir/Interfaces/DestinationStyleOpInterface.h>
 #include <mlir/Interfaces/InferTypeOpInterface.h>
+#include <mlir/Interfaces/LoopLikeInterface.h>
 #include <mlir/Pass/Pass.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 
@@ -331,156 +332,183 @@ auto tile(mlir::RewriterBase& rewriter, mlir::linalg::LinalgOp& op,
   });
 }
 
-auto lowerLoad(mlir::RewriterBase& rewriter, mlir::ktdp::LoadOp load,
-               const AttrMapping& mem_space_map)
-    -> llvm::FailureOr<mlir::ktdp_lowering::LoadOp> {
-  llvm::SmallVector<mlir::Attribute> hops{getMemorySpace(load.getAccessTile())};
-  auto* use = getSingleUse(load);
-  if (use == nullptr) {
+struct TileLoad : mlir::OpRewritePattern<mlir::tensor::ExtractSliceOp> {
+  explicit TileLoad(mlir::MLIRContext* context,
+                    const AttrMapping& mem_space_map)
+      : OpRewritePattern(context), mem_space_map_(mem_space_map) {}
+
+  auto matchAndRewrite(mlir::tensor::ExtractSliceOp extract,
+                       mlir::PatternRewriter& rewriter) const
+      -> mlir::LogicalResult override {
+    auto source = llvm::dyn_cast<mlir::OpResult>(extract.getSource());
+    if (!source) {
+      return rewriter.notifyMatchFailure(extract, "no data tile source");
+    }
+
+    // Erase all the via hops on the way to the `ktdp.load`.
+    llvm::SmallVector<mlir::Attribute> reverse_hops;
+    auto load = llvm::dyn_cast<mlir::ktdp::LoadOp>(source.getOwner());
+    while (!load) {
+      if (auto via = llvm::dyn_cast<mlir::ktdf::ViaOp>(source.getOwner());
+          via) {
+        llvm::append_range(reverse_hops, llvm::reverse(via.getHops()));
+        source = llvm::dyn_cast<mlir::OpResult>(via.getOperand());
+        if (!source) {
+          return rewriter.notifyMatchFailure(via, "no data tile source");
+        }
+        if (via->hasOneUse()) {
+          rewriter.replaceOp(via, source);
+        }
+      } else {
+        return rewriter.notifyMatchFailure(source.getOwner(),
+                                           "not a data tile source");
+      }
+
+      load = llvm::dyn_cast<mlir::ktdp::LoadOp>(source.getOwner());
+    }
+
+    // Canonicalize the via hops, counting the load as a hop as well.
+    reverse_hops.push_back(getMemorySpace(load.getAccessTile()));
+    for (auto& hop : reverse_hops) {
+      hop = mem_space_map_.map(hop);
+    }
+    reverse_hops.erase(std::unique(reverse_hops.begin(), reverse_hops.end()),
+                       reverse_hops.end());
+
+    // Create the `ktdp_lowering.load` that captures the applied tiling.
+    auto new_load = mlir::ktdp_lowering::LoadOp::create(
+        rewriter, load.getLoc(), extract.getType(), load.getAccessTile(),
+        extract);
+    setThrottle(new_load, getThrottle(extract->getOpResult(0)));
+
+    // Add the hops back in after the load and replace `tensor.extract_slice`.
+    mlir::Value loaded = new_load.getResult();
+    if (auto reverse_via = llvm::MutableArrayRef(reverse_hops).drop_back(1);
+        !reverse_via.empty()) {
+      std::reverse(reverse_via.begin(), reverse_via.end());
+      loaded = mlir::ktdf::ViaOp::create(rewriter, load.getLoc(), loaded,
+                                         rewriter.getArrayAttr(reverse_via));
+    }
+    rewriter.replaceOp(extract, loaded);
     if (load->use_empty()) {
       rewriter.eraseOp(load);
-      return llvm::success(nullptr);
+    }
+    return llvm::success();
+  }
+
+ private:
+  const AttrMapping& mem_space_map_;
+};
+
+struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
+  explicit TileStore(mlir::MLIRContext* context,
+                     const AttrMapping& mem_space_map)
+      : OpRewritePattern(context), mem_space_map_(mem_space_map) {}
+
+  auto matchAndRewrite(mlir::ktdp::StoreOp store,
+                       mlir::PatternRewriter& rewriter) const
+      -> mlir::LogicalResult override {
+    auto source = llvm::dyn_cast<mlir::OpResult>(store.getDataTile());
+    if (!source) {
+      return rewriter.notifyMatchFailure(store, "no data tile source");
     }
 
-    return load.emitError("tiling error: load has multiple uses");
-  }
-
-  // Erase all the via hops on the way to the `tensor.extract_slice`.
-  while (auto via = llvm::dyn_cast<mlir::ktdf::ViaOp>(use->getOwner())) {
-    llvm::append_range(hops, via.getHops());
-    use = getSingleUse(via);
-    if (use == nullptr) {
-      if (via->use_empty()) {
-        rewriter.eraseOp(via);
-        rewriter.eraseOp(load);
-        return llvm::success(nullptr);
-      }
-
-      return load.emitError("tiling error: load has multiple uses");
-    }
-
-    use->set(load);
-    rewriter.eraseOp(via);
-  }
-
-  auto extract_slice =
-      llvm::dyn_cast<mlir::tensor::ExtractSliceOp>(use->getOwner());
-  if (!extract_slice) {
-    auto diag = load->emitError("tiling error: no `tensor.extract_slice` sink");
-    diag.attachNote(use->getOwner()->getLoc()) << "found this instead";
-    return diag;
-  }
-
-  // Canonicalize the via hops, counting the load as a hop as well.
-  for (auto& hop : hops) {
-    hop = mem_space_map.map(hop);
-  }
-  hops.erase(std::unique(hops.begin(), hops.end()), hops.end());
-
-  // Create the `ktdp_lowering.load` that captures the applied tiling.
-  rewriter.setInsertionPointAfter(extract_slice);
-  auto new_load = mlir::ktdp_lowering::LoadOp::create(
-      rewriter, load.getLoc(), extract_slice.getType(), load.getAccessTile(),
-      extract_slice);
-  setThrottle(new_load, getThrottle(extract_slice->getOpResult(0)));
-
-  // Add the hops back in after the load and replace `tensor.extract_slice`.
-  mlir::Value loaded = new_load.getResult();
-  if (auto via = llvm::ArrayRef(hops).drop_front(1); !via.empty()) {
-    loaded = mlir::ktdf::ViaOp::create(rewriter, load.getLoc(), loaded,
-                                       rewriter.getArrayAttr(via));
-  }
-  rewriter.replaceOp(extract_slice, loaded);
-  rewriter.eraseOp(load);
-  return new_load;
-}
-
-auto lowerStore(mlir::RewriterBase& rewriter, mlir::ktdp::StoreOp store,
-                const AttrMapping& mem_space_map)
-    -> llvm::FailureOr<mlir::ktdp_lowering::StoreOp> {
-  llvm::SmallVector<mlir::Attribute> reverse_hops{
-      getMemorySpace(store.getAccessTile())};
-  auto source = llvm::dyn_cast<mlir::OpResult>(store.getDataTile());
-  if (!source) {
-    return store->emitError("tiling error: no data tile source");
-  }
-
-  // Erase all the via hops on the way to the insert_slice.
-  auto insert_slice =
-      llvm::dyn_cast<mlir::tensor::InsertSliceOp>(source.getOwner());
-  while (!insert_slice) {
-    if (auto via = llvm::dyn_cast<mlir::ktdf::ViaOp>(source.getOwner()); via) {
-      llvm::append_range(reverse_hops, via.getHops());
-      source = llvm::dyn_cast<mlir::OpResult>(via.getOperand());
-      if (!source) {
-        return via->emitError("tiling error: no data tile source");
-      }
-      if (via->hasOneUse()) {
-        rewriter.replaceOp(via, source);
-      }
-    } else if (auto loop = llvm::dyn_cast<mlir::scf::ForOp>(source.getOwner());
-               loop) {
-      source = llvm::dyn_cast<mlir::OpResult>(
-          loop.getBody()->getTerminator()->getOperand(
-              source.getResultNumber()));
-      if (!source) {
-        return loop.getBody()->getTerminator()->emitError(
-            "tiling error: no data tile source");
-      }
-    } else {
-      return store->emitError("tiling error: no data tile source");
-    }
-
-    insert_slice =
+    // Erase all the via hops on the way to the `tensor.insert_slice`.
+    mlir::scf::ForOp outermost;
+    llvm::SmallVector<mlir::Attribute> reverse_hops{
+        getMemorySpace(store.getAccessTile())};
+    auto insert_slice =
         llvm::dyn_cast<mlir::tensor::InsertSliceOp>(source.getOwner());
-  }
+    while (!insert_slice) {
+      if (auto via = llvm::dyn_cast<mlir::ktdf::ViaOp>(source.getOwner());
+          via) {
+        llvm::append_range(reverse_hops, via.getHops());
+        source = llvm::dyn_cast<mlir::OpResult>(via.getOperand());
+        if (!source) {
+          return rewriter.notifyMatchFailure(via, "no data tile source");
+        }
+        if (via->hasOneUse()) {
+          rewriter.replaceOp(via, source);
+        }
+      } else if (auto loop =
+                     llvm::dyn_cast<mlir::scf::ForOp>(source.getOwner());
+                 loop) {
+        outermost = outermost ? outermost : loop;
+        source = llvm::dyn_cast<mlir::OpResult>(
+            loop.getBody()->getTerminator()->getOperand(
+                source.getResultNumber()));
+        if (!source) {
+          return rewriter.notifyMatchFailure(loop.getBody()->getTerminator(),
+                                             "no data tile source");
+        }
+      } else {
+        return rewriter.notifyMatchFailure(source.getOwner(),
+                                           "not a data tile source");
+      }
 
-  // Canonicalize the via hops, counting the store as a hop as well.
-  for (auto& hop : reverse_hops) {
-    hop = mem_space_map.map(hop);
-  }
-  reverse_hops.erase(std::unique(reverse_hops.begin(), reverse_hops.end()),
-                     reverse_hops.end());
-  // Add the hops back in before the store.
-  rewriter.setInsertionPoint(insert_slice);
-  mlir::Value stored = insert_slice.getSource();
-  if (auto reverse_via = llvm::MutableArrayRef(reverse_hops).drop_front(1);
-      !reverse_via.empty()) {
-    std::reverse(reverse_via.begin(), reverse_via.end());
-    stored = mlir::ktdf::ViaOp::create(rewriter, store.getLoc(), stored,
-                                       rewriter.getArrayAttr(reverse_via));
-  }
-
-  // Create the `ktdp_lowering.store` that captures the applied tiling.
-  auto new_store = mlir::ktdp_lowering::StoreOp::create(
-      rewriter, store.getLoc(), stored, store.getAccessTile(), insert_slice);
-  setThrottle(new_store, getThrottle(insert_slice.getSourceMutable()));
-
-  rewriter.eraseOp(store);
-  rewriter.replaceAllUsesWith(insert_slice, insert_slice.getDest());
-  rewriter.eraseOp(insert_slice);
-  return new_store;
-}
-
-auto lowerLoadAndStore(mlir::RewriterBase& rewriter,
-                       llvm::ArrayRef<mlir::ktdp::LoadOp> loads,
-                       llvm::ArrayRef<mlir::ktdp::StoreOp> stores,
-                       const AttrMapping& mem_space_map)
-    -> llvm::LogicalResult {
-  for (auto load : loads) {
-    if (failed(lowerLoad(rewriter, load, mem_space_map))) {
-      return llvm::failure();
+      insert_slice =
+          llvm::dyn_cast<mlir::tensor::InsertSliceOp>(source.getOwner());
     }
-  }
 
-  for (auto store : stores) {
-    if (failed(lowerStore(rewriter, store, mem_space_map))) {
-      return llvm::failure();
+    if (outermost) {
+      if (llvm::any_of(outermost->getUsers(),
+                       [&](mlir::Operation* user) -> bool {
+                         return user->isBeforeInBlock(store);
+                       })) {
+        return rewriter.notifyMatchFailure(outermost,
+                                           "loop has users before store");
+      }
+      rewriter.moveOpBefore(outermost, store);
     }
+
+    // Canonicalize the via hops, counting the store as a hop as well.
+    for (auto& hop : reverse_hops) {
+      hop = mem_space_map_.map(hop);
+    }
+    reverse_hops.erase(std::unique(reverse_hops.begin(), reverse_hops.end()),
+                       reverse_hops.end());
+
+    // Determine the value to store. Conservatively, this must be the result of
+    // insert_slice, since we didn't check how that is computed.
+    mlir::Value stored = insert_slice.getResult();
+    if (auto loop = llvm::dyn_cast<mlir::LoopLikeOpInterface>(
+            insert_slice->getParentOp());
+        loop) {
+      auto dest_arg =
+          llvm::dyn_cast<mlir::BlockArgument>(insert_slice.getDest());
+      if (dest_arg && loop.getTiedLoopYieldedValue(dest_arg)->get() ==
+                          insert_slice.getResult()) {
+        // We know that insert_slice is a simple update on an iter_arg, which
+        // means it can be erased.
+        stored = insert_slice.getSource();
+        rewriter.replaceAllUsesWith(insert_slice.getResult(),
+                                    insert_slice.getDest());
+      }
+    }
+
+    // Add the hops back in before the store.
+    rewriter.setInsertionPointAfter(insert_slice);
+    if (auto reverse_via = llvm::MutableArrayRef(reverse_hops).drop_front(1);
+        !reverse_via.empty()) {
+      std::reverse(reverse_via.begin(), reverse_via.end());
+      stored = mlir::ktdf::ViaOp::create(rewriter, store.getLoc(), stored,
+                                         rewriter.getArrayAttr(reverse_via));
+    }
+
+    // Create the `ktdp_lowering.store` that captures the applied tiling.
+    auto new_store = mlir::ktdp_lowering::StoreOp::create(
+        rewriter, store.getLoc(), stored, store.getAccessTile(), insert_slice);
+    setThrottle(new_store, getThrottle(insert_slice.getSourceMutable()));
+    rewriter.eraseOp(store);
+    if (insert_slice->use_empty()) {
+      rewriter.eraseOp(insert_slice);
+    }
+    return llvm::success();
   }
 
-  return llvm::success();
-}
+ private:
+  const AttrMapping& mem_space_map_;
+};
 
 void breakLoopCarriedDependencies(mlir::RewriterBase& rewriter,
                                   mlir::DestinationStyleOpInterface op) {
@@ -496,52 +524,6 @@ void breakLoopCarriedDependencies(mlir::RewriterBase& rewriter,
     rewriter.replaceOp(slice, mlir::tensor::EmptyOp::create(
                                   rewriter, op.getLoc(), slice.getMixedSizes(),
                                   slice.getType().getElementType()));
-  }
-}
-
-void dropIterArgs(mlir::RewriterBase& rewriter,
-                  mlir::scf::LoopVector& loop_nest) {
-  assert(!loop_nest.empty());
-
-  // Create the new loop nest after the old one.
-  mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointAfter(loop_nest.front());
-  const auto get_lb = [&](mlir::scf::ForOp loop) {
-    return loop.getLowerBound();
-  };
-  const auto get_ub = [&](mlir::scf::ForOp loop) {
-    return loop.getUpperBound();
-  };
-  const auto get_step = [&](mlir::scf::ForOp loop) { return loop.getStep(); };
-  auto new_loops =
-      mlir::scf::buildLoopNest(rewriter, loop_nest.front().getLoc(),
-                               llvm::map_to_vector(loop_nest, get_lb),
-                               llvm::map_to_vector(loop_nest, get_ub),
-                               llvm::map_to_vector(loop_nest, get_step))
-          .loops;
-
-  // Move the loop body.
-  auto& body = *loop_nest.back().getBody();
-  auto& new_body = *new_loops.back().getBody();
-  new_body.getOperations().splice(new_body.begin(), body.getOperations(),
-                                  body.begin(),
-                                  body.without_terminator().end());
-
-  // Copy the attributes not set by buildLoopNest, update the result, and erase
-  // the old loop, from inside to outside.
-  for (auto [result, now] :
-       llvm::zip_equal(llvm::reverse(loop_nest), llvm::reverse(new_loops))) {
-    now->setDiscardableAttrs(result->getRawDictionaryAttrs());
-    now.setUnsignedCmp(result.getUnsignedCmp());
-
-    result.getInductionVar().replaceAllUsesWith(now.getInductionVar());
-    if (!result.getBodyRegion().empty()) {
-      rewriter.eraseBlock(result.getBody());
-    }
-    result->dropAllUses();
-    rewriter.eraseOp(result);
-
-    result = now;
   }
 }
 
@@ -657,20 +639,7 @@ void KTIRMapAndTilePass::runOnOperation() {
   mlir::func::FuncOp func = getOperation();
   mlir::IRRewriter rewriter(func);
 
-  // Collect `ktdp.(load|store)` operations and linalg operations.
-  llvm::SmallVector<mlir::ktdp::LoadOp> loads;
-  llvm::SmallVector<mlir::ktdp::StoreOp> stores;
-  llvm::SmallVector<mlir::linalg::LinalgOp> computes;
-  func.walk([&](mlir::Operation* op) {
-    if (auto load = mlir::dyn_cast<mlir::ktdp::LoadOp>(op); load) {
-      loads.push_back(load);
-    } else if (auto store = mlir::dyn_cast<mlir::ktdp::StoreOp>(op); store) {
-      stores.push_back(store);
-    } else if (auto compute = mlir::dyn_cast<mlir::linalg::GenericOp>(op);
-               compute) {
-      computes.push_back(compute);
-    }
-  });
+  auto computes = llvm::to_vector(func.getOps<mlir::linalg::LinalgOp>());
   if (computes.empty()) {
     return;
   }
@@ -712,43 +681,20 @@ void KTIRMapAndTilePass::runOnOperation() {
     breakLoopCarriedDependencies(rewriter, op);
   }
 
-  // Merge `tensor.(insert|extract)_slice` operations before lowering.
+  // Merge `tensor.(insert|extract)_slice` ops and tile `ktdp.(load|store)` and
+  // remove all the unneeded `iter_args`.
   {
     mlir::RewritePatternSet patterns(&getContext());
+    patterns.add<TileLoad, TileStore>(patterns.getContext(), mem_space_map);
     mlir::tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
+    mlir::populateRegionBranchOpInterfaceCanonicalizationPatterns(
+        patterns, mlir::scf::ForOp::getOperationName());
 
     if (failed(
             mlir::applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       signalPassFailure();
       return;
     }
-  }
-
-  // Lower all `ktdp.(load|store)` operations.
-  if (failed(lowerLoadAndStore(rewriter, loads, stores, mem_space_map))) {
-    signalPassFailure();
-    return;
-  }
-  loads.clear();
-  stores.clear();
-
-  // Remove the loop-carried dependencies altogether.
-  rewriter.setInsertionPoint(func.getBody().front().getTerminator());
-  for (auto& loop_nest : loop_nests) {
-    assert(!loop_nest.empty());
-    dropIterArgs(rewriter, loop_nest);
-    // FIXME: Lowering the stores hoisted them into the loop, which may have
-    //        broken SSA dependencies. Moving the loops to the end of the
-    //        function will restore this, but seems questionable.
-    loop_nest.front()->remove();
-    rewriter.insert(loop_nest.front());
-  }
-
-  // FIXME: Since the dropIterArgs and motion transforms are shady, run the
-  //        verifier on this function no matter what until we resolve this.
-  if (failed(mlir::verify(func, true))) {
-    signalPassFailure();
-    return;
   }
 
   // Broadcast compute operands back to target vector size.
@@ -758,7 +704,8 @@ void KTIRMapAndTilePass::runOnOperation() {
   }
 
   // Clean up all the unused function-level constants that remain.
-  for (auto& empty : llvm::make_early_inc_range(func.getOps())) {
+  for (auto& empty : llvm::make_early_inc_range(
+           llvm::reverse(func.getFunctionBody().front()))) {
     if (mlir::isOpTriviallyDead(&empty)) {
       rewriter.eraseOp(&empty);
     }

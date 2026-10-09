@@ -40,6 +40,7 @@
 #include "Utils.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
+#include "dataflow-scheduler/Transforms/Utils/DataTransfers.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 
 #define PASS_NAME "ktir-bufferize"
@@ -63,6 +64,48 @@ struct KTIRBufferizePass
   using KTIRBufferizePassBase<KTIRBufferizePass>::KTIRBufferizePassBase;
 
   void runOnOperation() override;
+};
+
+struct LowerLoad : mlir::OpRewritePattern<mlir::ktdp::LoadOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  auto matchAndRewrite(mlir::ktdp::LoadOp load,
+                       mlir::PatternRewriter& rewriter) const
+      -> llvm::LogicalResult override {
+    const auto result_type = load.getType();
+    if (!result_type.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(load, "dynamic shape");
+    }
+
+    llvm::SmallVector<int64_t> static_offsets(result_type.getRank(), 0);
+    llvm::SmallVector<int64_t> static_strides(result_type.getRank(), 1);
+    auto new_load = mlir::ktdp_lowering::LoadOp::create(
+        rewriter, load.getLoc(), result_type, load.getAccessTile(), {}, {}, {},
+        static_offsets, result_type.getShape(), static_strides);
+    rewriter.replaceOp(load, new_load);
+    return llvm::success();
+  }
+};
+
+struct LowerStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  auto matchAndRewrite(mlir::ktdp::StoreOp store,
+                       mlir::PatternRewriter& rewriter) const
+      -> llvm::LogicalResult override {
+    const auto data_type = store.getDataTile().getType();
+    if (!data_type.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(store, "dynamic shape");
+    }
+
+    llvm::SmallVector<int64_t> static_offsets(data_type.getRank(), 0);
+    llvm::SmallVector<int64_t> static_strides(data_type.getRank(), 1);
+    mlir::ktdp_lowering::StoreOp::create(
+        rewriter, store.getLoc(), store.getDataTile(), store.getAccessTile(),
+        {}, {}, {}, static_offsets, data_type.getShape(), static_strides);
+    rewriter.eraseOp(store);
+    return llvm::success();
+  }
 };
 
 struct LowerAccessTile
@@ -271,7 +314,9 @@ void KTIRBufferizePass::runOnOperation() {
   }
 
   mlir::RewritePatternSet patterns(&getContext());
+  patterns.add<LowerLoad, LowerStore>(patterns.getContext());
   patterns.add<LowerAccessTile>(patterns.getContext(), mem_space_map);
+  populateConvertToDataTransferPatterns(patterns);
 
   if (failed(mlir::applyPatternsGreedily(func, std::move(patterns)))) {
     signalPassFailure();
