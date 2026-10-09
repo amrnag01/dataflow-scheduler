@@ -51,10 +51,6 @@ enum class DataTransferType {
 [[nodiscard]] auto getFlattenedVectorType(mlir::ShapedType type)
     -> mlir::VectorType;
 
-/// Number of vector lanes the compute resource provides for `elem_type`.
-int64_t getVectorLanes(mlir::Type elem_type,
-                       mlir::ktdf_arch::ExecutionUnitOp compute);
-
 /// Match units by core ID between program_unit operands and target units,
 /// create a def_immutable_mapping + query_map, and return the query result.
 mlir::Value createQueryMapForComponent(

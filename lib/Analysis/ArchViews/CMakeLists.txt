@@ -9,6 +9,7 @@ add_dataflow_scheduler_library(DataflowSchedulerArchViews
   EXPORT_NAME ArchViews
 
   LINK_LIBS PUBLIC
+    DataflowSchedulerDialects::KTDFDialect
     DataflowSchedulerDialects::KTDFArchDialect
     DataflowSchedulerDialects::KTDFArchAnalysis
     KTIR::KtdpDialect

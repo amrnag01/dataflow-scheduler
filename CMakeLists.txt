@@ -113,7 +113,7 @@ if(DataflowScheduler_ENABLE_PYTHON_BINDINGS)
 endif()
 
 add_subdirectory(external)
-add_dependencies(dataflow-scheduler-headers dataflow-scheduler-dialects-headers ktir-headers)
+add_dependencies(dataflow-scheduler-headers dataflow-scheduler-dialects-headers ktir-headers mlir-headers)
 add_dependencies(dataflow-scheduler-doc dataflow-scheduler-dialects-doc ktir-doc)
 
 # Treat warnings as errors for all first-party sources. This block is
@@ -124,8 +124,11 @@ if(DataflowScheduler_ENABLE_WERROR)
   message(STATUS "DataflowScheduler: -Werror enabled for first-party sources")
 endif()
 
-set(CMAKE_CXX_VISIBILITY_PRESET hidden)
-set(CMAKE_VISIBILITY_INLINES_HIDDEN YES)
+# Shared libraries must export their symbols to each other.
+if(NOT BUILD_SHARED_LIBS)
+  set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+  set(CMAKE_VISIBILITY_INLINES_HIDDEN YES)
+endif()
 
 # Include DataflowScheduler CMake module.
 set(DataflowScheduler_INCLUDE_DIRS 

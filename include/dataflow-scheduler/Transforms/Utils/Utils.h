@@ -34,7 +34,7 @@
 
 #include <optional>
 
-#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
+#include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 
 namespace scheduler {
 
@@ -75,6 +75,10 @@ mlir::scf::ForOp createForOpWithAdditionalIterArgs(mlir::scf::ForOp loop_op,
 /// Erases the ops of \p roots that nothing reads, and whatever they were the
 /// last reader of.
 void eraseDeadAncestorOps(llvm::ArrayRef<mlir::Operation*> roots);
+
+/// Number of vector lanes the compute resource provides for `elem_type`.
+int64_t getVectorLanes(mlir::Type elem_type,
+                       mlir::ktdf_arch::ExecutionUnitOp compute);
 
 }  // namespace scheduler
 
