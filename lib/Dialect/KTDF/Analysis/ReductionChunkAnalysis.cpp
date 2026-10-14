@@ -18,6 +18,9 @@
 
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/ReductionChunkAnalysis.h"
 
+#include <llvm/ADT/SmallVector.h>
+
+#include <functional>
 #include <numeric>
 
 #include "llvm/Support/DebugLog.h"
@@ -32,22 +35,18 @@ using namespace mlir::ktdf;
 std::optional<ReductionChunkResult> mlir::ktdf::analyzeReductionChunks(
     linalg::GenericOp generic_op, int64_t chunk_size_threshold) {
   // Collect reduction dimension indices.
-  SmallVector<int64_t> reduction_dims;
-  auto iter_types = generic_op.getIteratorTypesArray();
-  for (int64_t i = 0; i < static_cast<int64_t>(iter_types.size()); ++i)
-    if (iter_types[i] == utils::IteratorType::reduction)
-      reduction_dims.push_back(i);
-
+  SmallVector<unsigned> reduction_dims;
+  generic_op.getReductionDims(reduction_dims);
   if (reduction_dims.empty()) {
-    LDBG(1) << DEBUG_TYPE ": no reduction iterators found";
+    LDBG(1) << "no reduction iterators found";
     return std::nullopt;
   }
 
   // Inspect the first input tensor.
-  auto input_type =
+  const auto input_type =
       dyn_cast<RankedTensorType>(generic_op.getInputs().front().getType());
   if (!input_type) {
-    LDBG(1) << DEBUG_TYPE ": first input is not a ranked tensor";
+    LDBG(1) << "first input is not a ranked tensor";
     return std::nullopt;
   }
 
@@ -56,27 +55,23 @@ std::optional<ReductionChunkResult> mlir::ktdf::analyzeReductionChunks(
     LDBG(1) << DEBUG_TYPE ": element type has no fixed bit-width";
     return std::nullopt;
   }
-  int64_t element_bytes =
+  const int64_t element_bytes =
       input_type.getElementType().getIntOrFloatBitWidth() / 8;
 
   // Compute total input bytes; bail on dynamic dimensions.
-  int64_t total_bytes = element_bytes;
-  for (int64_t sz : input_type.getShape()) {
-    if (sz == ShapedType::kDynamic) {
-      LDBG(1) << DEBUG_TYPE ": dynamic input dimension — cannot infer chunks";
-      return std::nullopt;
-    }
-    total_bytes *= sz;
+  if (!input_type.hasStaticShape()) {
+    LDBG(1) << "dynamic input dimension — cannot infer chunks";
+    return std::nullopt;
   }
+  const int64_t total_bytes = element_bytes * input_type.getNumElements();
 
   // Collect reduction-dimension sizes.
+  const auto loop_ranges = generic_op.getStaticLoopRanges();
   SmallVector<int64_t> red_dim_sizes;
   for (int64_t dim : reduction_dims) {
-    int64_t sz = input_type.getDimSize(dim);
+    const auto sz = loop_ranges[dim];
     if (sz == ShapedType::kDynamic) {
-      LDBG(1) << DEBUG_TYPE
-          ": dynamic reduction dimension — cannot infer "
-          "chunks";
+      LDBG(1) << "dynamic reduction dimension — cannot infer chunks";
       return std::nullopt;
     }
     red_dim_sizes.push_back(sz);
@@ -84,8 +79,8 @@ std::optional<ReductionChunkResult> mlir::ktdf::analyzeReductionChunks(
 
   // Upper bound: product of all reduction-dim sizes (each chunk = 1 element
   // along every reduction dim — the smallest meaningful chunk).
-  int64_t max_n = 1;
-  for (int64_t sz : red_dim_sizes) max_n *= sz;
+  const auto max_n = std::accumulate(red_dim_sizes.begin(), red_dim_sizes.end(),
+                                     int64_t{1}, std::multiplies<>{});
 
   // Find the smallest N ≥ 1 that brings the per-chunk byte count within the
   // threshold.
@@ -98,18 +93,19 @@ std::optional<ReductionChunkResult> mlir::ktdf::analyzeReductionChunks(
   }
 
   if (inferred_n == 0) {
-    LDBG(1) << DEBUG_TYPE ": no valid num_chunks found within threshold "
+    LDBG(1) << "no valid num_chunks found within threshold "
             << chunk_size_threshold << " bytes (total_bytes=" << total_bytes
             << ")";
     return std::nullopt;
   }
 
-  LDBG(1) << DEBUG_TYPE ": inferred num_chunks=" << inferred_n
+  LDBG(1) << "inferred num_chunks=" << inferred_n
           << " (total_bytes=" << total_bytes
           << ", threshold=" << chunk_size_threshold << ")";
 
   return ReductionChunkResult{inferred_n, /*chunk_sizes=*/{},
-                              std::move(reduction_dims)};
+                              std::move(reduction_dims),
+                              std::move(red_dim_sizes)};
 }
 
 std::optional<llvm::SmallVector<int64_t>> mlir::ktdf::computeChunkDims(

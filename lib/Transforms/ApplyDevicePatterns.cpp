@@ -22,6 +22,7 @@
 #include <mlir/Dialect/Bufferization/IR/Bufferization.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/Linalg/IR/Linalg.h>
+#include <mlir/Dialect/Linalg/IR/LinalgInterfaces.h>
 #include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/Dialect/PDL/IR/PDL.h>
@@ -223,6 +224,20 @@ auto ktdfIsTensorType(mlir::PatternRewriter& /*rewriter*/,
       llvm::isa<mlir::RankedTensorType>(values[0].cast<mlir::Type>()));
 }
 
+/// Constraint `linalg.is_contraction(op)` that determines whether the given op
+/// is a contraction.
+auto linalgIsContraction(mlir::PatternRewriter& /*rewriter*/,
+                         mlir::Operation* op) -> llvm::LogicalResult {
+  LDBG() << *op;
+
+  if (auto linalg_op = llvm::dyn_cast<mlir::linalg::LinalgOp>(op);
+      linalg_op && mlir::linalg::isaContractionOpInterface(linalg_op)) {
+    return llvm::success();
+  }
+
+  return llvm::failure();
+}
+
 // Rewrite helper: ktdf.memref_read_from_fifo(read) → Value
 //
 // Expected `values` entries, one of them:
@@ -289,6 +304,8 @@ class PatternCache : public mlir::ktdf_arch::PatternCache {
                                         ktdfIsReductionKind);
     patterns.registerConstraintFunction("ktdf.is_tensor_type",
                                         ktdfIsTensorType);
+    patterns.registerConstraintFunction("linalg.is_contraction",
+                                        linalgIsContraction);
     patterns.registerRewriteFunction("ktdf.memref_read_from_fifo",
                                      ktdfMemRefReadFromFifo);
     patterns.registerRewriteFunction("ktdf.memref_type_in_space",

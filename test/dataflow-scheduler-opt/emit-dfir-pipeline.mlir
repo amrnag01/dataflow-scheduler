@@ -17,6 +17,9 @@
 
 // CHECK:        builtin.module(
 // CHECK-NEXT:   ensure-device-declaration
+// CHECK-NEXT:   func.func(
+// CHECK-NEXT:   apply-device-patterns{groups={pre_mapping}}
+// CHECK-NEXT:   )
 // CHECK-NEXT:   ktir-legality-check
 // CHECK-NEXT:   compute-group-extraction
 // CHECK-NEXT:   indirect-compute-group-split

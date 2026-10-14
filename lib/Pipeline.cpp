@@ -44,8 +44,8 @@ void scheduler::buildKTIRFrontendPipeline(
   //   - The scheduler has not made any mapping / scheduling decisions yet.
   //  -> Apply patterns that subtitute front-end constructs that might make
   //     scheduler-illegal programs legal.
-  // pm.addNestedPass<mlir::func::FuncOp>(
-  //     createApplyDevicePatternsPass({"pre_mapping"}));
+  pm.addNestedPass<mlir::func::FuncOp>(
+      createApplyDevicePatternsPass({"pre_mapping"}));
 
   pm.addPass(createKTIRLegalityCheckPass());
   pm.addPass(createComputeGroupExtractionPass());

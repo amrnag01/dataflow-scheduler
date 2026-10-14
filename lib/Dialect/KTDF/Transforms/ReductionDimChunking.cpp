@@ -71,6 +71,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <mlir/Dialect/Linalg/IR/LinalgInterfaces.h>
+
 #include <memory>
 
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/ReductionChunkAnalysis.h"
@@ -205,6 +207,13 @@ struct ReductionDimChunkingPass
     linalg::GenericOp generic_op = findReductionGenericOp(compute_stage);
     assert(generic_op && "no reduction linalg.generic in compute stage");
 
+    // FIXME: Current implementation leads to invalid IR when processing
+    //        contractions, so skip them for now to allow matmul to pass.
+    if (linalg::isaContractionOpInterface(generic_op)) {
+      LDBG() << "ignoring contraction";
+      return success();
+    }
+
     // ------------------------------------------------------------------
     // Determine reduction dims and per-dim chunk sizes.
     //
@@ -215,8 +224,12 @@ struct ReductionDimChunkingPass
     // Explicit path (numChunks non-empty): one value per reduction dim;
     // nested scf.for loops; dims with count 1 produce no loop.
     // ------------------------------------------------------------------
-    SmallVector<int64_t> reduction_dims;
-    SmallVector<int64_t> chunk_sizes;
+    ReductionChunkResult reduction_chunk;
+
+    // FIXME: This implementation assumes that there is an injective mapping
+    //        from loop to shape space, i.e., for each iteration, there will be
+    //        a distinct element read from the first input tensor.
+    generic_op.getReductionDims(reduction_chunk.reduction_dims);
 
     if (numChunks.empty()) {
       // Auto-infer via analysis — GCD-based outer-to-inner chunking.
@@ -224,14 +237,12 @@ struct ReductionDimChunkingPass
       // Collect all reduction dims, excluding the innermost overall loop dim
       // if it is a reduction (the innermost loop dim must never be chunked,
       // regardless of iterator type).
-      {
-        auto iter_types = generic_op.getIteratorTypesArray();
-        int64_t last = static_cast<int64_t>(iter_types.size()) - 1;
-        for (int64_t i = 0; i < static_cast<int64_t>(iter_types.size()); ++i)
-          if (iter_types[i] == utils::IteratorType::reduction && i != last)
-            reduction_dims.push_back(i);
+      if (!reduction_chunk.reduction_dims.empty() &&
+          reduction_chunk.reduction_dims.back() ==
+              generic_op.getNumLoops() - 1) {
+        reduction_chunk.reduction_dims.pop_back();
       }
-      if (reduction_dims.empty()) {
+      if (reduction_chunk.reduction_dims.empty()) {
         LDBG(1) << PASS_NAME
             ": could not find a chunkable reduction dimension — skipping";
         return success();
@@ -245,16 +256,8 @@ struct ReductionDimChunkingPass
         return failure();
       }
 
-      // Collect per-dim sizes in reduction-dim order, using kDynamic for
-      // dims whose size is unknown so computeChunkDims can skip them.
-      auto input_type =
-          cast<RankedTensorType>(generic_op.getInputs().front().getType());
-      SmallVector<int64_t> red_dim_sizes;
-      red_dim_sizes.reserve(reduction_dims.size());
-      for (int64_t d : reduction_dims)
-        red_dim_sizes.push_back(input_type.getDimSize(d));
-
-      auto chunk_dims = computeChunkDims(red_dim_sizes, result->num_chunks);
+      auto chunk_dims =
+          computeChunkDims(result->red_dim_sizes, result->num_chunks);
       if (!chunk_dims) {
         inner_pipeline.emitError(
             PASS_NAME
@@ -262,33 +265,32 @@ struct ReductionDimChunkingPass
             "chunkable reduction dimensions");
         return failure();
       }
-      chunk_sizes = std::move(*chunk_dims);
+
+      reduction_chunk.num_chunks = result->num_chunks;
+      reduction_chunk.red_dim_sizes = std::move(result->red_dim_sizes);
+      reduction_chunk.chunk_sizes = std::move(*chunk_dims);
     } else {
       // User-supplied --num-chunks path: collect reduction dims and validate.
-      auto iter_types = generic_op.getIteratorTypesArray();
-      for (int64_t i = 0; i < static_cast<int64_t>(iter_types.size()); ++i)
-        if (iter_types[i] == utils::IteratorType::reduction)
-          reduction_dims.push_back(i);
-
-      if (reduction_dims.empty()) {
+      if (reduction_chunk.reduction_dims.empty()) {
         inner_pipeline.emitError(PASS_NAME
                                  ": could not find reduction dimension");
         return failure();
       }
 
-      if (numChunks.size() != reduction_dims.size()) {
+      if (numChunks.size() != reduction_chunk.reduction_dims.size()) {
         inner_pipeline.emitError(
             llvm::Twine(PASS_NAME ": numChunks has ") +
             llvm::Twine(numChunks.size()) + " entries but there are " +
-            llvm::Twine(reduction_dims.size()) + " reduction dims");
+            llvm::Twine(reduction_chunk.reduction_dims.size()) +
+            " reduction dims");
         return failure();
       }
 
-      auto input_type =
-          cast<RankedTensorType>(generic_op.getInputs().front().getType());
-      for (size_t j = 0; j < reduction_dims.size(); ++j) {
-        int64_t dim = reduction_dims[j];
-        int64_t dim_size = input_type.getDimSize(dim);
+      const auto loop_ranges = generic_op.getStaticLoopRanges();
+      for (size_t j = 0; j < reduction_chunk.reduction_dims.size(); ++j) {
+        const auto dim = reduction_chunk.reduction_dims[j];
+        const auto dim_size = loop_ranges[dim];
+        reduction_chunk.red_dim_sizes.push_back(dim_size);
         if (dim_size == ShapedType::kDynamic) {
           LDBG(1) << PASS_NAME
                   << ": dynamic reduction size not yet supported — skipping";
@@ -301,7 +303,8 @@ struct ReductionDimChunkingPass
                   << " size=" << dim_size << " — skipping";
           return success();
         }
-        chunk_sizes.push_back(dim_size / static_cast<int64_t>(nchunk));
+        reduction_chunk.chunk_sizes.push_back(dim_size /
+                                              static_cast<int64_t>(nchunk));
       }
     }
 
@@ -309,23 +312,23 @@ struct ReductionDimChunkingPass
     SmallVector<int64_t> per_dim_num_chunks;
     if (numChunks.empty()) {
       // Auto-inferred path: derive per-dim count from dim_size / chunk_size.
-      auto input_type =
-          cast<RankedTensorType>(generic_op.getInputs().front().getType());
-      for (size_t j = 0; j < reduction_dims.size(); ++j) {
-        int64_t dim_size = input_type.getDimSize(reduction_dims[j]);
+      for (size_t j = 0; j < reduction_chunk.reduction_dims.size(); ++j) {
+        const int64_t dim_size = reduction_chunk.red_dim_sizes[j];
         // Dynamic dims were skipped by computeChunkDims (chunk_sizes[j] left
         // at kDynamic) — treat as 1 chunk (no loop emitted).
         if (dim_size == ShapedType::kDynamic)
           per_dim_num_chunks.push_back(1);
         else
-          per_dim_num_chunks.push_back(dim_size / chunk_sizes[j]);
+          per_dim_num_chunks.push_back(dim_size /
+                                       reduction_chunk.chunk_sizes[j]);
       }
     } else {
       for (unsigned nc : numChunks)
         per_dim_num_chunks.push_back(static_cast<int64_t>(nc));
     }
 
-    LDBG(1) << PASS_NAME ": num_reduction_dims=" << reduction_dims.size();
+    LDBG(1) << PASS_NAME ": num_reduction_dims="
+            << reduction_chunk.reduction_dims.size();
 
     // One chunk on every dimension leaves the reduction as it is: the rewrite
     // below would rebuild the pipeline to emit the same program, differing only
@@ -339,8 +342,9 @@ struct ReductionDimChunkingPass
     }
 
     return rewriteComputeStage(inner_pipeline, load_stage, compute_stage,
-                               store_stage, generic_op, reduction_dims,
-                               chunk_sizes, per_dim_num_chunks);
+                               store_stage, generic_op,
+                               reduction_chunk.reduction_dims,
+                               reduction_chunk.chunk_sizes, per_dim_num_chunks);
   }
 
   // -----------------------------------------------------------------------
@@ -369,7 +373,7 @@ struct ReductionDimChunkingPass
   LogicalResult rewriteComputeStage(
       ktdf::PipelineOp inner_pipeline, ktdf::StageOp load_stage,
       ktdf::StageOp compute_stage, ktdf::StageOp store_stage,
-      linalg::GenericOp generic_op, ArrayRef<int64_t> reduction_dims,
+      linalg::GenericOp generic_op, ArrayRef<unsigned> reduction_dims,
       ArrayRef<int64_t> chunk_sizes, ArrayRef<int64_t> per_dim_num_chunks) {
     MLIRContext* context = inner_pipeline.getContext();
     IRRewriter rewriter(context);
