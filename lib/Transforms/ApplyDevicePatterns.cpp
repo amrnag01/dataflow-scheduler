@@ -252,8 +252,8 @@ auto linalgIsContraction(mlir::PatternRewriter& /*rewriter*/,
 // CreateOperation), so an attribute the op declares as its own would land
 // beside its real slot rather than in it, where no accessor would find it.
 //
-// The op lands at the rewriter's insertion point, which the pattern applicator
-// has set to the matched op.
+// The op lands immediately before the read it replaces, keeping its place in
+// the order the FIFO is drained.
 auto ktdfMemRefReadFromFifo(mlir::PatternRewriter& rewriter,
                             mlir::PDLResultList& results,
                             llvm::ArrayRef<mlir::PDLValue> values)

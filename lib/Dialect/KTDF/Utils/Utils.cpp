@@ -225,6 +225,8 @@ auto mlir::ktdf::convertTensorUsesToMemref(
 auto mlir::ktdf::convertFromTensorToMemref(OpBuilder& builder,
                                            ktdf::ReadFromFifoOp read_op)
     -> Value {
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPoint(read_op);
   auto tensor_type = cast<RankedTensorType>(read_op.getResult().getType());
   auto memref_type =
       MemRefType::get(tensor_type.getShape(), tensor_type.getElementType());

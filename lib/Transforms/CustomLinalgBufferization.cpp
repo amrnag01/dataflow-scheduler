@@ -92,7 +92,9 @@ static mlir::LogicalResult absorbIntoConsumer(
   // The results get a fresh allocation.  A sibling input arrives over a FIFO,
   // and is re-read as a memref -- that read has no address to load from, but
   // the lowering layer turns a memref read into a receive yielding the value
-  // directly, which is what the rebuilt op ends up consuming.
+  // directly, which is what the rebuilt op ends up consuming.  The re-read
+  // stays where the original was, not here at the generic: sibling slots can
+  // share one physical FIFO, which delivers in the order they were written.
   //
   // Whatever produced those tensors is about to be left with nothing reading
   // it, so note it down here: converting erases ops and would leave a handle
