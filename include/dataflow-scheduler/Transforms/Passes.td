@@ -677,18 +677,25 @@ def IndirectAccessLoopMaterializationPass
   ];
 }
 
-def LoopReorderingPass : Pass<"loop-reordering", "mlir::ModuleOp"> {
-  let summary = "Identify interchange-candidate loop sets for reordering";
+def LoopReorderingAndTilingPass : Pass<"loop-reordering-and-tiling", "mlir::ModuleOp"> {
+  let summary = "Jointly optimize loop reordering and tile size selection";
   let description = [{
-    Walks all scf.for loop nests and identifies groups of loops that can be
-    freely reordered with respect to each other, by classifying the ops that
-    appear between adjacent loop headers as hoistable, sinkable, or true
-    barriers. Adjacent loops with no true barrier between them are candidates
-    for interchange, and candidacy is extended transitively.
+    Combines loop reordering and tile size selection into a single optimization pass.
 
-    Currently the pass only prints the candidate sets and makes no IR changes.
+    1. Identifies groups of scf.for loops that can be freely reordered with respect
+       to each other, by classifying the ops that appear between adjacent loop
+       headers as hoistable, sinkable, or true barriers. Adjacent loops with no
+       true barrier between them are candidates for interchange.
+
+    2. Jointly selects tile sizes for the reordered loops based on:
+       - Loop bounds and hardware constraints
+       - Memory capacity limitations
+       - Data dependency patterns
+
+    This combined approach allows for more sophisticated optimization strategies
+    that consider both loop ordering and tile sizing together.
   }];
-  let constructor = "::scheduler::createLoopReorderingPass()";
+  let constructor = "::scheduler::createLoopReorderingAndTilingPass()";
   let dependentDialects = [
     "mlir::scf::SCFDialect"
   ];

@@ -118,8 +118,9 @@ void scheduler::buildSchedulerOptimizationPipeline(
   // selection pass would now take parallel instances into account while
   // determining tile sizes.
   pm.addPass(createParallelizeLoopsAcrossInstancesPass(scheduler_ctx));
-  pm.addPass(createLoopReorderingPass());
-  pm.addPass(mlir::ktdf::createTileSizeSelectionPass());
+  pm.addPass(createLoopReorderingAndTilingPass());
+  // Tile size selection is now combined into the loop reordering pass
+  // pm.addPass(mlir::ktdf::createTileSizeSelectionPass());
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(createAffineMinCanonicalizationPass());
   pm.addPass(mlir::ktdf::createSubsumeLinearizeIndexPass());

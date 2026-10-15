@@ -33,13 +33,13 @@
 #include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
 
-#define PASS_NAME "loop-reordering"
-// #define DEBUG_LOOPORDER
+#define PASS_NAME "loop-reordering-and-tiling"
+#define DEBUG_LOOP_TILING
 
 using namespace mlir;
 
 namespace scheduler {
-#define GEN_PASS_DEF_LOOPREORDERINGPASS
+#define GEN_PASS_DEF_LOOPREORDERINGANDTILINGPASS
 #include "dataflow-scheduler/Transforms/Passes.h.inc"
 }  // namespace scheduler
 
@@ -394,9 +394,11 @@ static void interchangeLoops(scf::ForOp forOpA, scf::ForOp forOpB) {
 
 // ---------------------------------------------------------------------------
 
-struct LoopReorderingPass
-    : public scheduler::impl::LoopReorderingPassBase<LoopReorderingPass> {
-  using LoopReorderingPassBase<LoopReorderingPass>::LoopReorderingPassBase;
+struct LoopReorderingAndTilingPass
+    : public scheduler::impl::LoopReorderingAndTilingPassBase<
+          LoopReorderingAndTilingPass> {
+  using LoopReorderingAndTilingPassBase<
+      LoopReorderingAndTilingPass>::LoopReorderingAndTilingPassBase;
 
   void runOnOperation() override {
     Operation* module = getOperation();
@@ -407,14 +409,15 @@ struct LoopReorderingPass
     SmallVector<CandidateSetInfo> candidateSets;
     findCandidateSets(module, candidateSets);
 
-#ifdef DEBUG_LOOPORDER
+#ifdef DEBUG_LOOP_TILING
     if (candidateSets.empty()) {
-      llvm::outs() << "[LoopReordering] No interchange-candidate loop sets "
-                      "found.\n";
+      llvm::outs()
+          << "[LoopReorderingAndTiling] No interchange-candidate loop sets "
+             "found.\n";
       return;
     }
 
-    llvm::outs() << "[LoopReordering] Found " << candidateSets.size()
+    llvm::outs() << "[LoopReorderingAndTiling] Found " << candidateSets.size()
                  << " interchange-candidate loop set(s):";
     for (auto [idx, info] : llvm::enumerate(candidateSets))
       printCandidateSet(static_cast<unsigned>(idx), info.loops, info.pairOps,
@@ -434,6 +437,6 @@ struct LoopReorderingPass
 
 }  // namespace
 
-std::unique_ptr<mlir::Pass> scheduler::createLoopReorderingPass() {
-  return std::make_unique<LoopReorderingPass>();
+std::unique_ptr<mlir::Pass> scheduler::createLoopReorderingAndTilingPass() {
+  return std::make_unique<LoopReorderingAndTilingPass>();
 }
