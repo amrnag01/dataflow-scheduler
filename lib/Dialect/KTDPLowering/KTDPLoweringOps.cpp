@@ -170,8 +170,6 @@ ParseResult ConstructIndirectAccessTileOp::parse(OpAsmParser& parser,
         return success();
       }))
     return failure();
-  result.attributes.clear();  // remove temporaries from parseAffineMapOfSSAIds
-
   // --- optional attr-dict ---
   if (parser.parseOptionalAttrDict(result.attributes)) return failure();
 
