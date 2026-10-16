@@ -483,6 +483,32 @@ static void symbolizeLoopOrdering(
       loop.setUpperBound(newUB);
       loop.setStep(newStep);
     }
+
+    // Step 4: Insert arg selection trees in the innermost loop body
+    // For perfectly nested loops, all IVs are accessible in the innermost body.
+    // For each original loop, create a select chain that picks its IV.
+    scf::ForOp innermostLoop = loops[numLoops - 1];
+    OpBuilder bodyBuilder(innermostLoop.getBody(), innermostLoop.getBody()->begin());
+
+    for (unsigned origLoopIdx = 0; origLoopIdx < numLoops; ++origLoopIdx) {
+      scf::ForOp lastLoop = loops[numLoops - 1];
+      Value selectedIV = lastLoop.getInductionVar();
+      for (int i = static_cast<int>(numLoops) - 2; i >= 0; --i) {
+        scf::ForOp iLoop = loops[i];
+        Value iv = iLoop.getInductionVar();
+        Value indexConst = arith::ConstantOp::create(
+            bodyBuilder, loc, bodyBuilder.getIndexType(),
+            bodyBuilder.getIndexAttr(i));
+        Value cond = arith::CmpIOp::create(
+            bodyBuilder, loc, arith::CmpIPredicate::eq, positions[origLoopIdx],
+            indexConst).getResult();
+        selectedIV = arith::SelectOp::create(bodyBuilder, loc, cond, iv,
+                                             selectedIV);
+      }
+
+      // Store selectedIV but don't use it yet
+      (void)selectedIV;
+    }
   }
 }
 
