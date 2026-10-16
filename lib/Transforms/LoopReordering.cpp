@@ -30,8 +30,10 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
+#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 
 #define PASS_NAME "loop-reordering-and-tiling"
 #define DEBUG_LOOP_TILING
@@ -394,6 +396,96 @@ static void interchangeLoops(scf::ForOp forOpA, scf::ForOp forOpB) {
 
 // ---------------------------------------------------------------------------
 
+struct LoopInfo {
+  Value lowerBound;
+  Value upperBound;
+  Value step;
+  Value inductionVar;
+
+  LoopInfo() = default;
+  LoopInfo(Value lb, Value ub, Value s, Value iv)
+      : lowerBound(lb), upperBound(ub), step(s), inductionVar(iv) {}
+};
+
+static void symbolizeLoopOrdering(
+    ArrayRef<CandidateSetInfo> candidateSets) {
+  // Map from candidate set to its position variables
+  llvm::DenseMap<const CandidateSetInfo*, SmallVector<Value>>
+      candidateSetPositions;
+
+  // Step 1: For each candidate set, gather metadata and create position vars
+  for (auto [candIdx, candidateSet] : llvm::enumerate(candidateSets)) {
+    const auto& loops = candidateSet.loops;
+    unsigned numLoops = loops.size();
+
+    // Map from original position (0..N-1) to LoopInfo
+    llvm::DenseMap<unsigned, LoopInfo> origLoopInfo;
+    for (unsigned i = 0; i < numLoops; ++i) {
+      auto loop = loops[i];
+      origLoopInfo[i] = LoopInfo(
+          loop.getLowerBound(),
+          loop.getUpperBound(),
+          loop.getStep(),
+          loop.getInductionVar()
+      );
+    }
+
+    // Step 2: Create position variables for this candidate set
+    SmallVector<Value> positions;
+    scf::ForOp firstLoop = loops[0];
+    Location loc = firstLoop.getLoc();
+    OpBuilder builder(firstLoop);
+    builder.setInsertionPoint(firstLoop);
+
+    for (unsigned i = 0; i < numLoops; ++i) {
+      auto posOp = mlir::ktdf::TilingReserveSizeOp::create(
+          builder, loc, builder.getIndexType(),
+          builder.getIndexAttr(0), builder.getIndexAttr(1));
+      positions.push_back(posOp.getResult());
+    }
+
+    candidateSetPositions[&candidateSet] = positions;
+
+    // Step 3: Rewrite loop bounds and steps using select chains
+    // Collect the bounds/steps for all original loops
+    SmallVector<Value> lbs, ubs, steps;
+    for (unsigned origIdx = 0; origIdx < numLoops; ++origIdx) {
+      lbs.push_back(origLoopInfo[origIdx].lowerBound);
+      ubs.push_back(origLoopInfo[origIdx].upperBound);
+      steps.push_back(origLoopInfo[origIdx].step);
+    }
+
+    // Build select chains once: select(pos==0, val[0], select(pos==1, val[1], ..., val[N-1]))
+    auto buildSelectChain = [&](ArrayRef<Value> bounds) -> Value {
+      Value result = bounds.back();
+      for (int i = static_cast<int>(bounds.size()) - 2; i >= 0; --i) {
+        Value pos = positions[i];
+        Value bound = bounds[i];
+        Value indexConst = arith::ConstantOp::create(
+            builder, loc, builder.getIndexType(), builder.getIndexAttr(i));
+        Value cond = arith::CmpIOp::create(
+            builder, loc, arith::CmpIPredicate::eq, pos, indexConst).getResult();
+        result = arith::SelectOp::create(builder, loc, cond, bound, result);
+      }
+      return result;
+    };
+
+    Value newLB = buildSelectChain(lbs);
+    Value newUB = buildSelectChain(ubs);
+    Value newStep = buildSelectChain(steps);
+
+    // Apply to all loops
+    for (unsigned loopIdx = 0; loopIdx < numLoops; ++loopIdx) {
+      scf::ForOp loop = loops[loopIdx];
+      loop.setLowerBound(newLB);
+      loop.setUpperBound(newUB);
+      loop.setStep(newStep);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 struct LoopReorderingAndTilingPass
     : public scheduler::impl::LoopReorderingAndTilingPassBase<
           LoopReorderingAndTilingPass> {
@@ -425,7 +517,10 @@ struct LoopReorderingAndTilingPass
     llvm::outs() << "\n";
 #endif
 
-    // Step 2(temp): Test reorderLoops by reversing every candidate set.
+    // Step 2: Symbolize loop ordering for each candidate set
+    symbolizeLoopOrdering(candidateSets);
+
+    // Step 3(temp): Test reorderLoops by reversing every candidate set.
     /*for (auto& info : candidateSets) {
       unsigned n = info.loops.size();
       SmallVector<unsigned> perm(n);
