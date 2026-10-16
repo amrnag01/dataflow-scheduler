@@ -455,27 +455,29 @@ static void symbolizeLoopOrdering(
       steps.push_back(origLoopInfo[origIdx].step);
     }
 
-    // Build select chains once: select(pos==0, val[0], select(pos==1, val[1], ..., val[N-1]))
-    auto buildSelectChain = [&](ArrayRef<Value> bounds) -> Value {
+    // Build nested select chain for each position:
+    // For loop at position i: select(pos[i]==0, val[0], select(pos[i]==1, val[1], ..., val[N-1]))
+    auto buildSelectChain = [&](Value posVar, ArrayRef<Value> bounds) -> Value {
+      // Start from the end as default, then build the chain forward
       Value result = bounds.back();
       for (int i = static_cast<int>(bounds.size()) - 2; i >= 0; --i) {
-        Value pos = positions[i];
         Value bound = bounds[i];
         Value indexConst = arith::ConstantOp::create(
             builder, loc, builder.getIndexType(), builder.getIndexAttr(i));
         Value cond = arith::CmpIOp::create(
-            builder, loc, arith::CmpIPredicate::eq, pos, indexConst).getResult();
+            builder, loc, arith::CmpIPredicate::eq, posVar, indexConst).getResult();
+        // select(posVar==i, bounds[i], result_from_previous_iteration)
         result = arith::SelectOp::create(builder, loc, cond, bound, result);
       }
       return result;
     };
 
-    Value newLB = buildSelectChain(lbs);
-    Value newUB = buildSelectChain(ubs);
-    Value newStep = buildSelectChain(steps);
-
-    // Apply to all loops
+    // Apply to all loops - each loop uses its corresponding position variable
     for (unsigned loopIdx = 0; loopIdx < numLoops; ++loopIdx) {
+      Value newLB = buildSelectChain(positions[loopIdx], lbs);
+      Value newUB = buildSelectChain(positions[loopIdx], ubs);
+      Value newStep = buildSelectChain(positions[loopIdx], steps);
+
       scf::ForOp loop = loops[loopIdx];
       loop.setLowerBound(newLB);
       loop.setUpperBound(newUB);
