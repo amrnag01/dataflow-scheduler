@@ -21,9 +21,25 @@
 #include "dataflow-scheduler/Analysis/InvarianceCheck.h"
 #include "dataflow-scheduler/Analysis/WriteSetScan.h"
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/PipelineScope.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 
 using namespace mlir;
 using namespace mlir::ktdf;
+
+auto mlir::ktdf::reuse::findUnderlyingAlloc(Value dest) -> memref::AllocOp {
+  if (auto alloc = dest.getDefiningOp<memref::AllocOp>()) {
+    return alloc;
+  }
+  if (auto private_op = dest.getDefiningOp<ktdf::PrivateOp>()) {
+    auto result_idx = cast<OpResult>(dest).getResultNumber();
+    ktdf::PrivateYieldOp yield_op = private_op.getYieldOp();
+    if (!yield_op || result_idx >= yield_op.getNumOperands()) {
+      return nullptr;
+    }
+    return findUnderlyingAlloc(yield_op.getOperand(result_idx));
+  }
+  return nullptr;
+}
 
 namespace {
 
@@ -85,6 +101,9 @@ auto mlir::ktdf::reuse::findFirstCandidate(::PipelineOp pipeline)
     }
     stage.walk([&](::DataTransferOp transfer) {
       if (transfer.isDestFifo()) {
+        return WalkResult::advance();
+      }
+      if (!findUnderlyingAlloc(transfer.getDestination())) {
         return WalkResult::advance();
       }
       int depth = findOutermostLegalTargetDepth(transfer, scope);

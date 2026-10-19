@@ -31,7 +31,7 @@
 // CHECK:           ktdp_lowering.construct_memory_view
 // CHECK-SAME:        sizes: [2, 32]
 // CHECK-SAME:        "IAB"
-// CHECK-SAME:        memref<2x32xindex, "IAB">
+// CHECK-SAME:        memref<2x32xi32, "IAB">
 
 // -- global addr-buf: also [2, 32].
 // CHECK:           ktdp.construct_memory_view {{.*}}, sizes: [2, 32]

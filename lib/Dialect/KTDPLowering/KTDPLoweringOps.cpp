@@ -581,3 +581,36 @@ void StoreOp::build(OpBuilder& builder, OperationState& state, Value source,
 
   build(builder, state, source, dest, sizes, static_sizes);
 }
+
+//===----------------------------------------------------------------------===//
+// IndLoadOp
+//===----------------------------------------------------------------------===//
+
+void IndLoadOp::build(OpBuilder& builder, OperationState& state,
+                      RankedTensorType result_type, Value ind_addr_buf,
+                      Value ind_addr_buf_index, Value base,
+                      ArrayRef<OpFoldResult> mixed_offsets,
+                      ArrayRef<OpFoldResult> mixed_sizes,
+                      ArrayRef<OpFoldResult> mixed_strides) {
+  const auto [static_offsets, offsets] = decomposeMixedValues(mixed_offsets);
+  const auto [static_sizes, sizes] = decomposeMixedValues(mixed_sizes);
+  const auto [static_strides, strides] = decomposeMixedValues(mixed_strides);
+  build(builder, state, result_type, ind_addr_buf, ind_addr_buf_index, base,
+        offsets, sizes, strides, static_offsets, static_sizes, static_strides);
+}
+
+//===----------------------------------------------------------------------===//
+// IndStoreOp
+//===----------------------------------------------------------------------===//
+
+void IndStoreOp::build(OpBuilder& builder, OperationState& state, Value source,
+                       Value ind_addr_buf, Value ind_addr_buf_index, Value base,
+                       ArrayRef<OpFoldResult> mixed_offsets,
+                       ArrayRef<OpFoldResult> mixed_sizes,
+                       ArrayRef<OpFoldResult> mixed_strides) {
+  const auto [static_offsets, offsets] = decomposeMixedValues(mixed_offsets);
+  const auto [static_sizes, sizes] = decomposeMixedValues(mixed_sizes);
+  const auto [static_strides, strides] = decomposeMixedValues(mixed_strides);
+  build(builder, state, source, ind_addr_buf, ind_addr_buf_index, base, offsets,
+        sizes, strides, static_offsets, static_sizes, static_strides);
+}

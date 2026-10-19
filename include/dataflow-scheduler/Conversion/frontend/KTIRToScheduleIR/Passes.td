@@ -54,6 +54,10 @@ def KTIRMapAndTilePass : Pass<"ktir-map-and-tile", "mlir::func::FuncOp"> {
     Performs device-specific mapping and tiling transformations on a normalized
     KTIR input program, leading to parallel loop nests with their load/store
     operations having been sunk/hoisted.
+
+    Compute operations that are already nested in loops (e.g. after
+    `IndirectAccessLoopMaterialization`) are mapped to a compute resource and
+    throttled, but not tiled.
   }];
   let dependentDialects = [
     "mlir::ktdf::KTDFDialect",
@@ -72,7 +76,12 @@ def KTIRBufferizePass : Pass<"ktir-bufferize", "mlir::func::FuncOp"> {
     with actual backing memory and `memref`s where needed.
 
     The following ops are bufferized by this pass:
-      - `ktdp.(load|store)`
+      - `ktdp.(load|store)` on direct tiles -> `ktdp_lowering.(load|store)`
+      - `ktdp.construct_access_tile` -> `memory_space_cast` + `reinterpret_cast`
+      - `ktdp.(load|store)` and `ktdp_lowering.(load|store)` on indirect tiles
+        (whose access tile is `ktdp_lowering.construct_indirect_access_tile`)
+        -> `ktdp_lowering.(ind_load|ind_store)`; the IAB memref is
+        `reinterpret_cast`-only (no `memory_space_cast`).
   }];
   let dependentDialects = [
     "mlir::arith::ArithDialect",

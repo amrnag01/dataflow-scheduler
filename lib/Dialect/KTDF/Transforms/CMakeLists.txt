@@ -1,4 +1,5 @@
 add_dataflow_scheduler_library(DataflowSchedulerKTDFTransforms
+    LoopIVAffineMulStrengthReduction.cpp
     StageCoarsening/BufferExpansion.cpp
     StageCoarsening/Materializer.cpp
     StageCoarsening/ScopeCorrection.cpp

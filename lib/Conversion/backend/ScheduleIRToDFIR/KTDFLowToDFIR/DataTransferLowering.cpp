@@ -344,7 +344,8 @@ struct LowerIndDataTransferPattern
 
     const auto throttle = getThrottle(op);
     if (!throttle) {
-      return rewriter.notifyMatchFailure(op, "unable to determine throttle");
+      return op.emitError()
+             << "missing '" << kThrottleAttrName << "' attribute";
     }
 
     const int64_t total_src = [&] {
@@ -761,8 +762,8 @@ struct LowerDataTransferPattern
 
     const auto throttle = getThrottle(data_transfer_op);
     if (!throttle) {
-      return rewriter.notifyMatchFailure(data_transfer_op,
-                                         "unable to determine throttle");
+      return data_transfer_op.emitError()
+             << "missing '" << kThrottleAttrName << "' attribute";
     }
 
     // Sizes describing the elements covered by one AGEN vector transfer, and

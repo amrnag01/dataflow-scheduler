@@ -23,6 +23,11 @@
 //   - global.mlir: All function declarations
 //   - <func-name>.mlir: Each function definition containing program_unit ops
 //
+// The first child module holds the declarations. Every later child module is
+// an implementation module, e.g. one per schedule as produced by
+// wrap-program-dfir; its functions may be nested in further modules. Other
+// top-level ops (e.g. ktdf_arch.device) are ignored.
+//
 // Example:
 //   Input module with:
 //     func.func @decl1() -> ()
@@ -77,22 +82,23 @@ struct SplitDFIROutputPass
     if (DisableThisPass) return;
     mlir::ModuleOp top_module = getOperation();
 
-    // Validate: exactly two child modules required.
+    // Validate: a declaration module followed by at least one implementation
+    // module.
     llvm::SmallVector<mlir::ModuleOp, 2> child_modules;
     for (auto& op : top_module.getBodyRegion().front()) {
       if (auto mod = mlir::dyn_cast<mlir::ModuleOp>(op))
         child_modules.push_back(mod);
     }
-    if (child_modules.size() != 2) {
+    if (child_modules.size() < 2) {
       top_module.emitError()
-          << "SplitDFIROutputPass expects exactly 2 child modules, got "
+          << "SplitDFIROutputPass expects at least 2 child modules, got "
           << child_modules.size();
       signalPassFailure();
       return;
     }
 
-    mlir::ModuleOp decl_module = child_modules[0];
-    mlir::ModuleOp impl_module = child_modules[1];
+    mlir::ModuleOp decl_module = child_modules.front();
+    auto impl_modules = llvm::ArrayRef(child_modules).drop_front();
 
     // Resolve output directory.
     llvm::SmallString<128> out_dir(outputDir);
@@ -101,7 +107,9 @@ struct SplitDFIROutputPass
               mlir::dyn_cast<mlir::FileLineColLoc>(top_module.getLoc())) {
         llvm::StringRef parent =
             llvm::sys::path::parent_path(file_loc.getFilename().getValue());
-        out_dir.assign(parent);
+        // A bare file name (e.g. "gather.ktir") has no parent; use the
+        // current directory.
+        out_dir.assign(parent.empty() ? llvm::StringRef(".") : parent);
       } else {
         top_module.emitError()
             << "output-dir not specified and source location unavailable";
@@ -180,27 +188,29 @@ struct SplitDFIROutputPass
     // Build <funcname>.mlir for each impl function with program_unit ops.
     bool found_impl = false;
     bool write_failed = false;
-    impl_module.walk([&](mlir::func::FuncOp func) {
-      if (!hasProgramUnits(func)) return mlir::WalkResult::advance();
-      found_impl = true;
+    for (auto impl_module : impl_modules) {
+      impl_module.walk([&](mlir::func::FuncOp func) {
+        if (!hasProgramUnits(func)) return mlir::WalkResult::advance();
+        found_impl = true;
 
-      mlir::OwningOpRef<mlir::ModuleOp> impl_mod =
-          mlir::ModuleOp::create(builder.getUnknownLoc());
-      mlir::OpBuilder ib(impl_mod->getBodyRegion());
-      auto* cloned = ib.clone(*func.getOperation());
-      if (auto f = mlir::dyn_cast<mlir::func::FuncOp>(cloned))
-        f.setVisibility(mlir::SymbolTable::Visibility::Public);
+        mlir::OwningOpRef<mlir::ModuleOp> impl_mod =
+            mlir::ModuleOp::create(builder.getUnknownLoc());
+        mlir::OpBuilder ib(impl_mod->getBodyRegion());
+        auto* cloned = ib.clone(*func.getOperation());
+        if (auto f = mlir::dyn_cast<mlir::func::FuncOp>(cloned))
+          f.setVisibility(mlir::SymbolTable::Visibility::Public);
 
-      std::string filename = funcNameToFilename(func.getSymName());
-      if (!writeModule(impl_mod.get(), filename)) {
-        write_failed = true;
-        return mlir::WalkResult::interrupt();
+        std::string filename = funcNameToFilename(func.getSymName());
+        if (!writeModule(impl_mod.get(), filename)) {
+          write_failed = true;
+          return mlir::WalkResult::interrupt();
+        }
+        return mlir::WalkResult::advance();
+      });
+      if (write_failed) {
+        signalPassFailure();
+        return;
       }
-      return mlir::WalkResult::advance();
-    });
-    if (write_failed) {
-      signalPassFailure();
-      return;
     }
 
     if (!found_impl) {

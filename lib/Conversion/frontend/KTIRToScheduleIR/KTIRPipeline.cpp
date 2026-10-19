@@ -16,6 +16,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/SmallVectorExtras.h>
@@ -43,11 +44,11 @@
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/PipelineBuilder.h"
+#include "dataflow-scheduler/Dialect/KTDF/Utils/DataTransfers.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/Mapping.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchAttributes.h"
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
-#include "dataflow-scheduler/Transforms/Utils/DataTransfers.h"
 
 #define PASS_NAME "ktir-pipeline"
 #define DEBUG_TYPE PASS_NAME
@@ -271,6 +272,51 @@ struct EraseStageMapping : mlir::OpRewritePattern<mlir::ktdf::StageOp> {
   return loop;
 }
 
+/// Finds the view @p memref is derived from by looking through casts and
+/// subviews, so that different views of the same buffer compare equal.
+[[nodiscard]] auto getRootView(mlir::Value memref) -> mlir::Value {
+  while (auto* const op = memref.getDefiningOp()) {
+    if (auto cast = llvm::dyn_cast<mlir::memref::ReinterpretCastOp>(op); cast) {
+      memref = cast.getSource();
+    } else if (auto cast = llvm::dyn_cast<mlir::memref::MemorySpaceCastOp>(op);
+               cast) {
+      memref = cast.getSource();
+    } else if (auto subview = llvm::dyn_cast<mlir::memref::SubViewOp>(op);
+               subview) {
+      memref = subview.getSource();
+    } else {
+      break;
+    }
+  }
+
+  return memref;
+}
+
+/// Gets the indirect address buffer of a `ktdp_lowering.ind_(load|store)`.
+[[nodiscard]] auto getIndAddrBuf(mlir::Operation* op) -> mlir::Value {
+  if (auto load = llvm::dyn_cast<mlir::ktdp_lowering::IndLoadOp>(op); load) {
+    return load.getIndAddrBuf();
+  }
+  if (auto store = llvm::dyn_cast<mlir::ktdp_lowering::IndStoreOp>(op); store) {
+    return store.getIndAddrBuf();
+  }
+
+  return nullptr;
+}
+
+/// Gets the memref written by a `ktdf.data_transfer` or `ktdp_lowering.store`.
+[[nodiscard]] auto getWrittenMemRef(mlir::Operation* op) -> mlir::Value {
+  if (auto transfer = llvm::dyn_cast<mlir::ktdf::DataTransferOp>(op);
+      transfer) {
+    return transfer.getDestination();
+  }
+  if (auto store = llvm::dyn_cast<mlir::ktdp_lowering::StoreOp>(op); store) {
+    return store.getDest();
+  }
+
+  return nullptr;
+}
+
 }  // namespace
 
 void KTIRPipelinePass::runOnOperation() {
@@ -317,6 +363,8 @@ void KTIRPipelinePass::runOnOperation() {
     mlir::ConversionTarget target(getContext());
     target.addIllegalOp<mlir::ktdp_lowering::LoadOp>();
     target.addIllegalOp<mlir::ktdp_lowering::StoreOp>();
+    target.addIllegalOp<mlir::ktdp_lowering::IndLoadOp>();
+    target.addIllegalOp<mlir::ktdp_lowering::IndStoreOp>();
     target.addIllegalOp<mlir::ktdf::ViaOp>();
 
     if (failed(mlir::applyPartialConversion(pipelines, target, {}))) {
@@ -339,32 +387,45 @@ auto KTIRPipelinePass::createPipeline(mlir::RewriterBase& rewriter,
   mlir::ktdf::PipelineBuilder builder(rewriter, loc, &allocator);
   llvm::DenseMap<mlir::Attribute, mlir::ktdf::StageOp> store_stages;
 
+  const auto place_store =
+      [&](mlir::ktdf::PipelineBuilder& builder, mlir::Operation* op,
+          mlir::Value dest) -> mlir::ktdf::PipelineBuilder::Placement {
+    LDBG() << "inserting store " << *op;
+    const auto memory_space = getMemorySpace(dest);
+    if (!memory_space) {
+      LDBG() << "  (FAILED) unable to determine memory space" << *op;
+      return nullptr;
+    }
+
+    const auto [it, invalid] = store_stages.try_emplace(memory_space);
+    if (invalid) {
+      auto stage_builder = builder.getStageBuilder();
+      it->second = mlir::ktdf::StageOp::create(stage_builder, {}, {});
+      it->second.setApplicableUnitsAttr(
+          stage_builder.getArrayAttr({memory_space}));
+    }
+
+    return it->second;
+  };
+
   const auto place =
       [&](mlir::ktdf::PipelineBuilder& builder,
           mlir::Operation* op) -> mlir::ktdf::PipelineBuilder::Placement {
     // Stores go into the special store_stages that aren't considerd otherwise.
     if (auto store = llvm::dyn_cast<mlir::ktdp_lowering::StoreOp>(op); store) {
-      LDBG() << "inserting store " << store;
-      const auto memory_space = getMemorySpace(store.getDest());
-      if (!memory_space) {
-        LDBG() << "  (FAILED) unable to determine memory space" << store;
-        return nullptr;
-      }
-
-      const auto [it, invalid] = store_stages.try_emplace(memory_space);
-      if (invalid) {
-        auto stage_builder = builder.getStageBuilder();
-        it->second = mlir::ktdf::StageOp::create(stage_builder, {}, {});
-        it->second.setApplicableUnitsAttr(
-            stage_builder.getArrayAttr({memory_space}));
-      }
-
-      return it->second;
+      return place_store(builder, op, store.getDest());
+    }
+    if (auto store = llvm::dyn_cast<mlir::ktdp_lowering::IndStoreOp>(op);
+        store) {
+      return place_store(builder, op, store.getBase());
     }
 
     // Loads go into existing or newly created, reusable stages.
     if (auto load = llvm::dyn_cast<mlir::ktdp_lowering::LoadOp>(op); load) {
       return builder.tryPlacement(getMemorySpace(load.getSource()));
+    }
+    if (auto load = llvm::dyn_cast<mlir::ktdp_lowering::IndLoadOp>(op); load) {
+      return builder.tryPlacement(getMemorySpace(load.getBase()));
     }
 
     // Vias are split into hops and go into newly created stages not considered
@@ -398,10 +459,67 @@ auto KTIRPipelinePass::createPipeline(mlir::RewriterBase& rewriter,
                : nullptr;
   };
 
-  // Insert all the stores and their dependencies.
-  rewriter.getInsertionBlock()->walk([&](mlir::ktdp_lowering::StoreOp store) {
-    builder.insert({store}, place, dominance);
+  // Collect the indirect transfers and the indirect address buffers they use.
+  auto* const block = rewriter.getInsertionBlock();
+  llvm::SmallVector<mlir::Operation*> ind_ops;
+  llvm::DenseSet<mlir::Value> ind_addr_bufs;
+  block->walk([&](mlir::Operation* op) {
+    if (auto ind_addr_buf = getIndAddrBuf(op); ind_addr_buf) {
+      ind_ops.push_back(op);
+      ind_addr_bufs.insert(getRootView(ind_addr_buf));
+    }
   });
+
+  // Insert all the stores and their dependencies. Stores that fill an indirect
+  // address buffer are left to be co-located with their indirect transfer.
+  block->walk([&](mlir::Operation* op) {
+    if (auto store = llvm::dyn_cast<mlir::ktdp_lowering::StoreOp>(op);
+        store && !ind_addr_bufs.contains(getRootView(store.getDest()))) {
+      builder.insert({op}, place, dominance);
+    } else if (llvm::isa<mlir::ktdp_lowering::IndStoreOp>(op)) {
+      builder.insert({op}, place, dominance);
+    }
+  });
+
+  // Move the fills of each indirect address buffer into the stage of the
+  // indirect transfer that uses it, ahead of that transfer. The buffer's state
+  // is local to the unit that executes the stage, so it can't cross a stage
+  // boundary. A fill is moved as the op in the insertion block that contains
+  // the writer (e.g. its `scf.if` guard), together with its producers.
+  for (auto* const ind_op : ind_ops) {
+    auto stage = builder.getStage(ind_op);
+    if (!stage) {
+      LDBG() << "(WARN) indirect transfer not in pipeline " << *ind_op;
+      continue;
+    }
+
+    const auto ind_addr_buf = getRootView(getIndAddrBuf(ind_op));
+    llvm::SmallVector<mlir::Operation*> fills;
+    block->walk([&](mlir::Operation* op) {
+      const auto dest = getWrittenMemRef(op);
+      if (!dest || getRootView(dest) != ind_addr_buf || builder.getStage(op)) {
+        return;
+      }
+      if (auto* const fill = block->findAncestorOpInBlock(*op);
+          fill && !llvm::is_contained(fills, fill)) {
+        fills.push_back(fill);
+      }
+    });
+
+    const auto place_fill =
+        [&](mlir::ktdf::PipelineBuilder& builder,
+            mlir::Operation* op) -> mlir::ktdf::PipelineBuilder::Placement {
+      return llvm::is_contained(fills, op)
+                 ? mlir::ktdf::PipelineBuilder::Placement(stage)
+                 : place(builder, op);
+    };
+    // Ops are inserted at the beginning of the stage, so insert the fills in
+    // reverse to keep their order.
+    for (auto* const fill : llvm::reverse(fills)) {
+      LDBG() << "inserting fill " << *fill;
+      builder.insert({fill}, place_fill, dominance);
+    }
+  }
 
   auto result = builder.build();
   LDBG() << "created " << result;

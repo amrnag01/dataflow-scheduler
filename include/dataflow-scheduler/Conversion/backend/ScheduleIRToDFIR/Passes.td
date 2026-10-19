@@ -110,6 +110,10 @@ def SplitDFIROutputPass : Pass<"emit-split-dfir", "mlir::ModuleOp"> {
       - global.mlir: declaration module (entry functions + forward decls)
       - <funcname>.mlir: one file per implementation function that contains
         dataflow.program_unit ops
+    The first child module is the declaration module; every later child module
+    (e.g. one per schedule, as produced by wrap-program-dfir) is searched for
+    implementation functions, including in nested modules. Other top-level ops
+    (e.g. ktdf_arch.device) are ignored.
     Top-level aliases (#map, #set) are copied into every output module.
   }];
   let constructor = "::scheduler::createSplitDFIROutputPass()";

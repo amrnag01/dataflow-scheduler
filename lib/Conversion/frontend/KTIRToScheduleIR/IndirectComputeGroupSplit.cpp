@@ -30,8 +30,8 @@
 /// meet primarily at the address buffer, whose address is a compile-time
 /// constant both of them materialize; @<name>_idx_to_addr may additionally
 /// take whatever block arguments its address computation cannot do without
-/// (an index memref or data-tensor base or stride that is not a compile-time
-/// constant), forwarded from @<name>'s own call site.
+/// (an indirect-index memref or data-tensor base or stride that is not a
+/// compile-time constant), forwarded from @<name>'s own call site.
 ///
 /// Each candidate is handled in two phases.  analyzeCandidate() and the helpers
 /// it calls are pure: they validate the input and derive everything the rewrite
@@ -295,9 +295,9 @@ static Value createAddressBufferView(OpBuilder& builder, Location loc,
 /// in rather than materialized here so that a caller building several tiles
 /// shares a single constant.
 ///
-/// @p coordinate_set is that of the index memory view, over which every buffer
-/// involved in the split is laid out.  The tile's element type is `index`, as
-/// it is for every ktdp access tile.
+/// @p coordinate_set is that of the indirect-index memory view, over which
+/// every buffer involved in the split is laid out.  The tile's element type is
+/// `index`, as it is for every ktdp access tile.
 static Value createFullAccessTile(OpBuilder& builder, Location loc,
                                   Value memory_view, ArrayRef<int64_t> shape,
                                   Value zero_index, IntegerSet coordinate_set) {
@@ -365,7 +365,8 @@ struct SplitCandidate {
   ktdp::ConstructIndirectAccessTilesOp indirect_op;
   func::FuncOp func;
   ModuleOp module;
-  /// Memory view of the raw index memref, and its (fully static) type.
+  /// Memory view of the indirect-index memref (element type from arch spec,
+  /// e.g. i32), and its (fully static) type.
   ktdp::ConstructMemoryViewOp idx_view;
   MemRefType idx_type;
   /// Position of the single indirect dimension in $per_dim_subscript_kinds.
@@ -608,8 +609,8 @@ static FailureOr<DenseI32ArrayAttr> deriveIndAddrBufDimPositions(
   // (captured_variables..., intermediate_variables...) space — a position is
   // all $ind_addr_buf_dim_positions can encode, never arithmetic.  That is
   // enough because the address buffer holds one resolved address per element of
-  // the index memref, laid out identically, so subscript r has only to select
-  // the same element it selected of the index memref.
+  // the indirect-index memref, laid out identically, so subscript r has only to
+  // select the same element it selected of the indirect-index memref.
   SmallVector<int32_t> iab_dim_positions;
   iab_dim_positions.reserve(indir_map.getNumResults());
   for (unsigned r = 0, e = indir_map.getNumResults(); r < e; ++r) {
@@ -667,7 +668,7 @@ static FailureOr<SplitCandidate> analyzeCandidate(
   candidate.module = candidate.func->getParentOfType<ModuleOp>();
   assert(candidate.module && "candidate func must be enclosed in a module");
 
-  // The index memref: exactly one indirect dimension is supported.
+  // The indirect-index memref: exactly one indirect dimension is supported.
   auto idx_memrefs = indirect_op.getIndirectMemrefs();
   if (idx_memrefs.empty())
     return indirect_op->emitError(
@@ -695,8 +696,8 @@ static FailureOr<SplitCandidate> analyzeCandidate(
         ": indirect memref operand is not defined by a "
         "ktdp.construct_memory_view");
 
-  // The address buffer mirrors the index memref and is allocated at compile
-  // time, so the memory tracker could not accept a runtime size.
+  // The address buffer mirrors the indirect-index memref and is allocated at
+  // compile time, so the memory tracker could not accept a runtime size.
   const auto is_dynamic = [](int64_t size) {
     return size == ShapedType::kDynamic;
   };
@@ -706,13 +707,13 @@ static FailureOr<SplitCandidate> analyzeCandidate(
     return candidate.func->emitError(
         PASS_NAME
         ": indirect memref has dynamic sizes; only fully static "
-        "shapes are supported on the index memory view");
+        "shapes are supported on the indirect-index memory view");
   if (!candidate.idx_view.getStrides().empty() ||
       llvm::any_of(candidate.idx_view.getStaticStrides(), is_dynamic))
     return candidate.func->emitError(
         PASS_NAME
         ": indirect memref has dynamic strides; only fully "
-        "static strides are supported on the index memory view");
+        "static strides are supported on the indirect-index memory view");
 
   // The indirect dimension is the unique position whose subscript kind is true.
   ArrayAttr subscript_kinds = indirect_op.getPerDimSubscriptKinds();
@@ -815,6 +816,10 @@ static std::string buildIdxToAddrModule(
           << func.getName() << ", address buffer at " << addr_buf_base;
 
   // @<new_func_name>(<one index per forwarded arg>)
+  // forwarded_args are block arguments of the gather/scatter function whose
+  // dependency chains reach base_addr, stride_value or idx_view's operands.
+  // All of them are index-typed: ConstructMemoryViewOp's offset/stride operands
+  // are always index in MLIR's memref model.
   OpBuilder builder(ctx);
   builder.setInsertionPointToStart(new_module.getBody());
 
@@ -874,9 +879,10 @@ static std::string buildIdxToAddrModule(
   Value addr_buf_view = createAddressBufferView(
       builder, loc, idx_view_clone, addr_buf_base_const, compute_type);
 
-  // Load the raw indices out of the index memref.  ktdp.load only verifies
-  // shapes, so asking for compute_type elements out of a view whose element
-  // type still carries signedness (si32) is valid and saves a conversion.
+  // Load the raw indices out of the indirect-index memref.  ktdp.load only
+  // verifies shapes, so asking for compute_type elements out of a view whose
+  // element type still carries signedness (si32) is valid and saves a
+  // conversion.
   Value c0 = arith::ConstantIndexOp::create(builder, loc, 0);
   Value idx_tile = createFullAccessTile(
       builder, loc, idx_view_clone.getResult(), idx_shape, c0, coordinate_set);
@@ -941,8 +947,8 @@ static std::string buildIdxToAddrModule(
 
 /// Rewrites the gather/scatter child-module function around @p indirect_op in
 /// place.  The function keeps its signature and its compute, but stops
-/// subscripting the index memref and instead dereferences the IAB, which it
-/// fills from the address buffer @<name>_idx_to_addr wrote:
+/// subscripting the indirect-index memref and instead dereferences the IAB,
+/// which it fills from the address buffer @<name>_idx_to_addr wrote:
 ///   - build an IAB view over the address buffer, and a global view of the same
 ///   - copy the address buffer into the IAB (ktdp.load then ktdp.store)
 ///   - rebuild the $base view with a zero offset, the original having been
@@ -963,8 +969,8 @@ static void rewriteGatherScatterModule(
   LDBG(1) << "rewriting @" << func.getName()
           << " to address through the IAB, indirect dimension " << indir_dim;
 
-  // The address buffer and the IAB both mirror the index memref's static shape,
-  // strides and coordinate set; only their element types differ.
+  // The address buffer and the IAB both mirror the indirect-index memref's
+  // static shape, strides and coordinate set; only their element types differ.
   ArrayRef<int64_t> idx_shape =
       cast<MemRefType>(idx_view.getResult().getType()).getShape();
   IntegerSet coordinate_set = idx_view.getCoordinateSetAttr().getValue();
@@ -982,12 +988,11 @@ static void rewriteGatherScatterModule(
   // ktdp_lowering.construct_memory_view rather than the ktdp one because "IAB"
   // is a plain StringAttr, which ktdp.construct_memory_view rejects at
   // verification time — it constrains $memory_space to a Ktdp_MemorySpaceAttr.
-  // IAB entries are flat absolute addresses, hence the `index` element type.
-  Type index_type = builder.getIndexType();
+  // IAB entries use the arch-spec entry type (e.g. i32).
   Value iab_view = ktdp_lowering::ConstructMemoryViewOp::create(
       builder, loc,
       /*resultType=*/
-      MemRefType::get(idx_shape, index_type, nullptr, iab_mem_space),
+      MemRefType::get(idx_shape, compute_type, nullptr, iab_mem_space),
       /*offset=*/addr_buf_base_const,
       /*sizes=*/ValueRange{},
       /*strides=*/ValueRange{},
@@ -1005,7 +1010,8 @@ static void rewriteGatherScatterModule(
   Value addr_buf_tile = createFullAccessTile(builder, loc, addr_buf_view,
                                              idx_shape, c0, coordinate_set);
   Value addr_tensor =
-      ktdp::LoadOp::create(builder, loc, addr_buf_tile, index_type).getResult();
+      ktdp::LoadOp::create(builder, loc, addr_buf_tile, compute_type)
+          .getResult();
   Value iab_tile = createFullAccessTile(builder, loc, iab_view, idx_shape, c0,
                                         coordinate_set);
   ktdp::StoreOp::create(builder, loc, addr_tensor, iab_tile);
@@ -1024,8 +1030,8 @@ static void rewriteGatherScatterModule(
       /*memory_space=*/base_view.getMemorySpace(),
       /*coordinate_set=*/base_view.getCoordinateSetAttr());
 
-  // The indirect dimension's original map subscripted into the index memref
-  // (e.g. `(d0,d1,d2,d3) -> (d2, d3)`).  The lowering op resolves that
+  // The indirect dimension's original map subscripted into the indirect-index
+  // memref (e.g. `(d0,d1,d2,d3) -> (d2, d3)`).  The lowering op resolves that
   // indirection through the IAB instead, so its direct offset into $base along
   // that dimension must be zero; every other dimension keeps its map verbatim.
   //
@@ -1144,8 +1150,8 @@ static void updateOrchestrator(SymbolTable& orch_sym_table,
 
 /// Erases @p op and then any of its operands' defining ops that this made
 /// trivially dead.  Used to drop the scaffolding the rewrite leaves behind: the
-/// index memory view the gather/scatter function no longer reads, and the
-/// stride constant that only the orchestrator ends up using.
+/// indirect-index memory view the gather/scatter function no longer reads, and
+/// the stride constant that only the orchestrator ends up using.
 static void eraseNowDeadOp(Operation* op) {
   SmallVector<Operation*> worklist{op};
   while (!worklist.empty()) {
@@ -1226,9 +1232,9 @@ static LogicalResult splitCandidate(const SplitCandidate& candidate,
             << "; skipping orchestrator update";
 
   // Drop the scaffolding this candidate no longer needs: the stride constant,
-  // which lives on in the orchestrator's clone, and the index memory view,
-  // which the gather/scatter function stops reading once its addresses come
-  // from the IAB.
+  // which lives on in the orchestrator's clone, and the indirect-index memory
+  // view, which the gather/scatter function stops reading once its addresses
+  // come from the IAB.
   if (materialized_stride) eraseNowDeadOp(materialized_stride);
   eraseNowDeadOp(candidate.idx_view);
   return success();

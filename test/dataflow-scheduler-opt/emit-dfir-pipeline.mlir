@@ -84,6 +84,7 @@
 // CHECK-NEXT:   custom-linalg-bufferization
 // CHECK-NEXT:   address-assignment
 // CHECK-NEXT:   normalize-grid-to-1d
+// CHECK-NEXT:   loop-iv-affine-mul-strength-reduction
 // CHECK-NEXT:   ktdf-to-ktdflowering
 // CHECK-NEXT:   builtin.module(
 // CHECK-NEXT:   func.func(

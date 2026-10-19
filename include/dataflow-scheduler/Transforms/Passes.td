@@ -722,8 +722,16 @@ def IndirectAccessLoopMaterializationPass
     dimension of $base) OR the full-coverage condition (variables_space_set
     bound < dimension size). Variables that satisfy both conditions are
     retained so that ConstructThreeStagePipeline can read the per-transfer
-    tile size. Materialized loops are annotated parallel_loop.
-    No-op when all remaining variables satisfy both conditions, or when no
+    tile size, as long as the retained region does not exceed the SIMD lane
+    count of the default compute unit for $base's element type. Retained
+    variables are admitted innermost-first; the first one that would push the
+    region past the lane count, and every variable outside it, is
+    materialized instead. The innermost variable is always retained. If the
+    device has no default compute unit or SIMD lane count for the element
+    type, `materialize-loops-without-simd-lanes` (default true) selects
+    between materializing every variable but the innermost one and applying
+    no lane limit. Materialized loops are annotated parallel_loop.
+    No-op when all remaining variables are retained, or when no
     ktdp_lowering.construct_indirect_access_tile is present.
   }];
   let constructor = "::scheduler::createIndirectAccessLoopMaterializationPass()";

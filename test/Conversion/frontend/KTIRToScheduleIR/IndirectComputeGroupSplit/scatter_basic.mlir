@@ -63,7 +63,7 @@
 // CHECK:         func.func @local_schedule_0
 // CHECK:           ktdp_lowering.construct_memory_view
 // CHECK-SAME:        "IAB"
-// CHECK-SAME:        memref<2x32xindex, "IAB">
+// CHECK-SAME:        memref<2x32xi32, "IAB">
 // CHECK:           ktdp.construct_memory_view {{.*}}, sizes: [2, 32]
 // CHECK-SAME:        memory_space = #ktdp.memory_space<global>
 // CHECK-SAME:        memref<2x32xi32

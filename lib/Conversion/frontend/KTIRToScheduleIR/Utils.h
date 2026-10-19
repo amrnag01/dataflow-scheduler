@@ -29,6 +29,7 @@
 #include "dataflow-scheduler/Dialect/KTDF/KTDFAttributes.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDFEnums.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchAttributes.h"
+#include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 
 namespace scheduler {
@@ -50,17 +51,25 @@ using AccessTile = mlir::TypedValue<mlir::ktdp::AccessTileType>;
 
 [[nodiscard]] inline auto getMemorySpace(AccessTile access_tile)
     -> mlir::Attribute {
-  auto source = access_tile.getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>();
-  if (!source) {
-    return nullptr;
+  if (auto source =
+          access_tile.getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>()) {
+    auto base = llvm::dyn_cast<MemRef>(source.getBase());
+    if (!base) {
+      return nullptr;
+    }
+    return getMemorySpace(base);
   }
 
-  auto base = llvm::dyn_cast<MemRef>(source.getBase());
-  if (!base) {
-    return nullptr;
+  if (auto source = access_tile.getDefiningOp<
+                    mlir::ktdp_lowering::ConstructIndirectAccessTileOp>()) {
+    auto base = llvm::dyn_cast<MemRef>(source.getBase());
+    if (!base) {
+      return nullptr;
+    }
+    return getMemorySpace(base);
   }
 
-  return getMemorySpace(base);
+  return nullptr;
 }
 
 [[nodiscard]] inline auto getMemorySpace(mlir::Value value) -> mlir::Attribute {

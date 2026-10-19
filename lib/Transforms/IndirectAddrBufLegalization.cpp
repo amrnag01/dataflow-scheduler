@@ -390,7 +390,7 @@ materializeWindowLoops(mlir::ktdp_lowering::ConstructIndirectAccessTileOp op,
         cur_iab_mv.getCoordinateSet().getValue(), /*drop_dim=*/0);
     mlir::Attribute iab_memory_space = cur_iab_mv.getMemorySpace();
     auto new_iab_memref_type = mlir::MemRefType::get(
-        new_iab_shape, mlir::IndexType::get(ctx),
+        new_iab_shape, cur_iab_memref_type.getElementType(),
         mlir::MemRefLayoutAttrInterface{}, iab_memory_space);
 
     LDBG(1) << "  narrowed IAB memref: " << cur_iab_memref_type << " -> "

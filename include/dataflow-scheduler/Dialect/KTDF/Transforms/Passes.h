@@ -46,6 +46,8 @@ auto createReductionLoopExposurePass() -> std::unique_ptr<Pass>;
 
 auto createStageCoarseningPass() -> std::unique_ptr<Pass>;
 
+auto createLoopIVAffineMulStrengthReductionPass() -> std::unique_ptr<Pass>;
+
 auto createSubsumeLinearizeIndexPass() -> std::unique_ptr<Pass>;
 
 auto createTileSizeSelectionPass() -> std::unique_ptr<Pass>;

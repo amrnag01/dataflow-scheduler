@@ -124,6 +124,29 @@ struct KTIRMapAndTilePass
   return llvm::success();
 }
 
+/// Maps @p op to the default compute resource, unless it already is, and
+/// annotates the vector width for @p element_type on it as the throttle.
+///
+/// @return The vector width.
+auto mapToCompute(mlir::linalg::LinalgOp op, mlir::ktdf_arch::Mapping& mapping,
+                  mlir::Type element_type) -> int64_t {
+  auto compute =
+      mapping.getOrMap(op, mapping.byKind().getDefaultCompute().getKind());
+  assert(compute && "no default compute resource");
+
+  LDBG() << "  compute: " << mlir::OpWithFlags(compute, kSkipRegions);
+
+  // Determine the desired vector width on the compute resource.
+  const auto simd_feature =
+      compute.getFeature<mlir::ktdf_arch::feature::SIMD>();
+  const auto vector_length =
+      std::max(simd_feature.getLanes(element_type), int64_t{1});
+
+  // Annotate the vector width as the throttle for this operation.
+  setThrottle(op, vector_length);
+  return vector_length;
+}
+
 auto determineTileSizes(mlir::linalg::LinalgOp op,
                         mlir::ktdf_arch::Mapping& mapping,
                         llvm::SmallVectorImpl<int64_t>& tile_sizes)
@@ -142,21 +165,8 @@ auto determineTileSizes(mlir::linalg::LinalgOp op,
          << mlir::OpWithFlags(op, kSkipRegions);
 
   // Map the op to a compute resource, if it isn't already.
-  auto compute =
-      mapping.getOrMap(op, mapping.byKind().getDefaultCompute().getKind());
-  assert(compute && "no default compute resource");
-
-  LDBG() << "  compute: " << mlir::OpWithFlags(compute, kSkipRegions);
-
-  // Determine the desired vector width on the compute resource.
-  const auto element_type = result_type.getElementType();
-  const auto simd_feature =
-      compute.getFeature<mlir::ktdf_arch::feature::SIMD>();
   const auto vector_length =
-      std::max(simd_feature.getLanes(element_type), int64_t{1});
-
-  // Annotate the vector width as the throttle for this operation.
-  setThrottle(op, vector_length);
+      mapToCompute(op, mapping, result_type.getElementType());
 
   // The tile-sizes vector must cover every loop dimension (getNumLoops()).
   // Reduction dimensions are skipped (tile size = 0) so the tiling infra does
@@ -639,8 +649,16 @@ void KTIRMapAndTilePass::runOnOperation() {
   mlir::func::FuncOp func = getOperation();
   mlir::IRRewriter rewriter(func);
 
+  // Compute operations already nested in loops (e.g. by
+  // IndirectAccessLoopMaterialization) are mapped but not tiled.
   auto computes = llvm::to_vector(func.getOps<mlir::linalg::LinalgOp>());
-  if (computes.empty()) {
+  llvm::SmallVector<mlir::linalg::LinalgOp> nested_computes;
+  func.walk([&](mlir::linalg::LinalgOp op) {
+    if (op->getParentOp() != func) {
+      nested_computes.push_back(op);
+    }
+  });
+  if (computes.empty() && nested_computes.empty()) {
     return;
   }
 
@@ -658,6 +676,21 @@ void KTIRMapAndTilePass::runOnOperation() {
           "mem_space_mapping");
       map) {
     mem_space_map.insert_range(map);
+  }
+
+  for (auto op : nested_computes) {
+    const auto result_type =
+        op->getNumResults() == 1
+            ? llvm::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType())
+            : nullptr;
+    if (!op.hasPureTensorSemantics() || !result_type) {
+      op->emitError("mapping error: expected pure tensor semantics");
+      signalPassFailure();
+      return;
+    }
+
+    LDBG() << "mapping nested " << mlir::OpWithFlags(op, kSkipRegions);
+    mapToCompute(op, mapping, result_type.getElementType());
   }
 
   // Tile all the compute operations and put them into loop nests that feature

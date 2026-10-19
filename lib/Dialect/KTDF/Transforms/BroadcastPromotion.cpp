@@ -52,25 +52,7 @@ namespace mlir::ktdf {
 
 namespace {
 
-/// Find the underlying memref.alloc that defines `dest`. If `dest` is a
-/// direct alloc result, return it. If `dest` is a result of a
-/// ktdf.private op, walk the corresponding private_yield operand back to
-/// the alloc inside the private body. Returns nullptr if no alloc can be
-/// found through the chain.
-memref::AllocOp findUnderlyingAlloc(Value dest) {
-  if (auto alloc = dest.getDefiningOp<memref::AllocOp>()) {
-    return alloc;
-  }
-  if (auto private_op = dest.getDefiningOp<ktdf::PrivateOp>()) {
-    auto result_idx = cast<OpResult>(dest).getResultNumber();
-    ktdf::PrivateYieldOp yield_op = private_op.getYieldOp();
-    if (!yield_op || result_idx >= yield_op.getNumOperands()) {
-      return nullptr;
-    }
-    return findUnderlyingAlloc(yield_op.getOperand(result_idx));
-  }
-  return nullptr;
-}
+using mlir::ktdf::reuse::findUnderlyingAlloc;
 
 /// Clone the defining memref.alloc of `orig_dest` immediately before
 /// `insert_before_op`. Returns the cloned alloc's SSA result value.

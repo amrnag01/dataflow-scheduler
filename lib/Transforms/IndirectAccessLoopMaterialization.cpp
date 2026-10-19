@@ -68,6 +68,15 @@ static llvm::cl::opt<bool> EnforceMinimumTransferSize(
                    "hardware transfer size"),
     llvm::cl::init(true));
 
+static llvm::cl::opt<bool> MaterializeLoopsWithoutSimdLanes(
+    "materialize-loops-without-simd-lanes",
+    llvm::cl::desc("When the device has no default compute unit, or it has no "
+                   "SIMD lane count for $base's element type, materialize a "
+                   "loop for every direct-subscript variable but the "
+                   "innermost one. If false, the SIMD lane count does not "
+                   "limit the retained region."),
+    llvm::cl::init(true));
+
 namespace {
 
 /// One remaining direct-subscript intermediate variable, classified against
@@ -99,12 +108,22 @@ mlir::FailureOr<unsigned> findReferencedDim(mlir::AffineMap map,
 
 /// Classify every remaining intermediate variable of `op` against `$base`'s
 /// own dimension order: a variable is retained when its dimension is both
-/// densely packed with its neighbor and fully covered by the tile; otherwise
-/// it needs a materialized loop. `loop_vars` is returned sorted by `base_dim`
-/// ascending (outermost $base dimension first).
+/// densely packed with its neighbor and fully covered by the tile, and the
+/// retained region it joins does not outgrow `max_retained_elements`;
+/// otherwise it needs a materialized loop. `loop_vars` is returned sorted by
+/// `base_dim` ascending (outermost $base dimension first).
+///
+/// Retained variables are admitted innermost-first. The innermost one is
+/// always kept, since it is the contiguous region the hardware transfers.
+/// Once admitting a variable would push the product of the retained trip
+/// counts past `max_retained_elements` (the SIMD lane count of the element
+/// type), it and every variable outside it are demoted to loops, because a
+/// retained dimension cannot sit outside a materialized loop. A
+/// non-positive `max_retained_elements` means no limit.
 mlir::LogicalResult classifyDirectVariables(
     mlir::ktdp_lowering::ConstructIndirectAccessTileOp op,
     llvm::ArrayRef<int64_t> base_sizes, llvm::ArrayRef<int64_t> base_strides,
+    int64_t max_retained_elements,
     llvm::SmallVectorImpl<DirectVarInfo>& loop_vars,
     llvm::SmallVectorImpl<DirectVarInfo>& retained_vars) {
   unsigned base_rank = static_cast<unsigned>(base_sizes.size());
@@ -170,6 +189,30 @@ mlir::LogicalResult classifyDirectVariables(
       loop_vars.push_back(info);
   }
 
+  if (max_retained_elements > 0 && !retained_vars.empty()) {
+    llvm::sort(retained_vars,
+               [](const DirectVarInfo& a, const DirectVarInfo& b) {
+                 return a.base_dim > b.base_dim;  // innermost first
+               });
+    int64_t retained_count = 1;
+    size_t keep = 0;
+    for (const DirectVarInfo& r : retained_vars) {
+      retained_count *= r.trip_count;
+      if (keep > 0 && retained_count > max_retained_elements) break;
+      ++keep;
+    }
+    for (size_t j = keep; j < retained_vars.size(); ++j) {
+      LDBG(1) << "  interm_idx=" << retained_vars[j].interm_idx
+              << " base_dim=" << retained_vars[j].base_dim
+              << " demoted to loop_var: retained region would exceed "
+              << max_retained_elements << " elements";
+      loop_vars.push_back(retained_vars[j]);
+    }
+    retained_vars.resize(keep);
+    // Restore the outermost-first order the rest of the pass relies on.
+    std::reverse(retained_vars.begin(), retained_vars.end());
+  }
+
   llvm::sort(loop_vars, [](const DirectVarInfo& a, const DirectVarInfo& b) {
     return a.base_dim < b.base_dim;
   });
@@ -222,6 +265,24 @@ struct TransferSizeInfo {
   llvm::DenseMap<mlir::Attribute, mlir::Attribute> mem_space_map;
   mlir::ktdf_arch::Resource load_unit;   // null if none co-located with IAB
   mlir::ktdf_arch::Resource store_unit;  // null if none co-located with IAB
+  // The device's default compute unit, whose SIMD lane count bounds how many
+  // elements of a retained region a single transfer may carry. Null if the
+  // device declares none.
+  mlir::ktdf_arch::ExecutionUnitOp compute;
+
+  /// The most elements of `elem_type` a retained region may hold. Returns 0
+  /// (no limit) if the device does not say and
+  /// `MaterializeLoopsWithoutSimdLanes` is off; otherwise 1, which keeps only
+  /// the innermost variable.
+  [[nodiscard]] int64_t getMaxRetainedElements(mlir::Type elem_type) const {
+    int64_t lanes = 0;
+    if (auto unit = compute) {
+      if (auto simd = unit.getFeature<mlir::ktdf_arch::feature::SIMD>())
+        lanes = simd.getLanes(elem_type);
+    }
+    if (lanes > 0) return lanes;
+    return MaterializeLoopsWithoutSimdLanes ? 1 : 0;
+  }
 
   /// Resolves a ktdp-level logical memory space (e.g.
   /// `#ktdp.memory_space<global>`) to the concrete arch Kind attribute
@@ -307,9 +368,13 @@ mlir::LogicalResult materializeDirectAccessLoops(
   unsigned base_rank = static_cast<unsigned>(base_sizes.size());
 
   // ── Step 1: classify ────────────────────────────────────────────────────
+  const int64_t max_retained_elements = transfer_info.getMaxRetainedElements(
+      mlir::cast<mlir::MemRefType>(base_mv.getResult().getType())
+          .getElementType());
   llvm::SmallVector<DirectVarInfo> loop_vars, retained_vars;
   if (mlir::failed(classifyDirectVariables(op, base_sizes, base_strides,
-                                           loop_vars, retained_vars)))
+                                           max_retained_elements, loop_vars,
+                                           retained_vars)))
     return mlir::failure();
 
   // How $base is used, needed by both Step 2 and Step 4
@@ -691,9 +756,9 @@ struct IndirectAccessLoopMaterializationPass
       mem_space_map.insert_range(mapping);
     }
 
-    TransferSizeInfo transfer_info{std::move(mem_space_map),
-                                   load_kind.getExemplar(),
-                                   store_kind.getExemplar()};
+    TransferSizeInfo transfer_info{
+        std::move(mem_space_map), load_kind.getExemplar(),
+        store_kind.getExemplar(), resource_kinds.getDefaultCompute()};
 
     LDBG(1) << "found IAB-colocated load unit="
             << static_cast<bool>(transfer_info.load_unit)

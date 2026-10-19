@@ -151,6 +151,7 @@ void scheduler::buildSchedulerOptimizationPipeline(
 
 void scheduler::buildDFIRBackendPipeline(
     mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
+  pm.addPass(mlir::ktdf::createLoopIVAffineMulStrengthReductionPass());
   pm.addPass(createKTDFToKTDFLoweringPass(scheduler_ctx));
 
   // Checkpoint 'post_lowering':
