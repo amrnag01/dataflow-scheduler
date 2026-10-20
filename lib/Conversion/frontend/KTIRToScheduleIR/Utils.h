@@ -25,72 +25,13 @@
 #include <mlir/IR/MLIRContext.h>
 #include <mlir/IR/Value.h>
 
-#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/DataTransferLowering.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDFAttributes.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDFEnums.h"
+#include "dataflow-scheduler/Dialect/KTDF/Utils/DataTransfers.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchAttributes.h"
-#include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 
 namespace scheduler {
-
-using MemRef = mlir::TypedValue<mlir::MemRefType>;
-using AccessTile = mlir::TypedValue<mlir::ktdp::AccessTileType>;
-
-[[nodiscard]] inline auto getMemorySpace(MemRef memref) -> mlir::Attribute {
-  if (const auto space = memref.getType().getMemorySpace(); space) {
-    return space;
-  }
-
-  if (auto source = memref.getDefiningOp<mlir::ktdp::ConstructMemoryViewOp>()) {
-    return source.getMemorySpace();
-  }
-
-  return nullptr;
-}
-
-[[nodiscard]] inline auto getMemorySpace(AccessTile access_tile)
-    -> mlir::Attribute {
-  if (auto source =
-          access_tile.getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>()) {
-    auto base = llvm::dyn_cast<MemRef>(source.getBase());
-    if (!base) {
-      return nullptr;
-    }
-    return getMemorySpace(base);
-  }
-
-  if (auto source = access_tile.getDefiningOp<
-                    mlir::ktdp_lowering::ConstructIndirectAccessTileOp>()) {
-    auto base = llvm::dyn_cast<MemRef>(source.getBase());
-    if (!base) {
-      return nullptr;
-    }
-    return getMemorySpace(base);
-  }
-
-  return nullptr;
-}
-
-[[nodiscard]] inline auto getMemorySpace(mlir::Value value) -> mlir::Attribute {
-  if (auto access_tile = llvm::dyn_cast<AccessTile>(value); access_tile) {
-    return getMemorySpace(access_tile);
-  }
-  if (auto memref = llvm::dyn_cast<MemRef>(value); memref) {
-    return getMemorySpace(memref);
-  }
-
-  return nullptr;
-}
-
-struct AttrMapping : llvm::DenseMap<mlir::Attribute, mlir::Attribute> {
-  using DenseMap::DenseMap;
-
-  [[nodiscard]] auto map(mlir::Attribute attr) const -> mlir::Attribute {
-    const auto mapped = lookup(attr);
-    return mapped ? mapped : attr;
-  }
-};
 
 [[nodiscard]] inline auto getSingleUse(mlir::Value value) -> mlir::OpOperand* {
   const auto uses = value.getUses();
@@ -98,29 +39,6 @@ struct AttrMapping : llvm::DenseMap<mlir::Attribute, mlir::Attribute> {
     return nullptr;
   }
   return &*uses.begin();
-}
-
-[[nodiscard]] inline auto getThrottle(mlir::Operation* op) -> int64_t {
-  const auto attr =
-      op->getAttrOfType<mlir::ktdf_arch::I64Attr>(kThrottleAttrName);
-  return attr ? attr.getValue() : std::numeric_limits<int64_t>::max();
-};
-[[nodiscard]] inline auto getThrottle(mlir::OpResult result) -> int64_t {
-  auto min = std::numeric_limits<int64_t>::max();
-  for (auto* user : result.getUsers()) {
-    min = std::min(min, getThrottle(user));
-  }
-  return min;
-};
-[[nodiscard]] inline auto getThrottle(mlir::OpOperand& operand) -> int64_t {
-  auto result = llvm::dyn_cast<mlir::OpResult>(operand.get());
-  return result ? getThrottle(result.getOwner())
-                : std::numeric_limits<int64_t>::max();
-}
-
-inline void setThrottle(mlir::Operation* op, int64_t value) {
-  op->setAttr(kThrottleAttrName,
-              mlir::ktdf_arch::I64Attr::get(op->getContext(), value));
 }
 
 [[nodiscard]] inline auto getLoopType(mlir::utils::IteratorType type)

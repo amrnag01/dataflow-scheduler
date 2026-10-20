@@ -23,6 +23,7 @@
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/DebugLog.h>
 #include <llvm/Support/LogicalResult.h>
+#include <mlir/Dialect/Affine/IR/AffineOps.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/Linalg/IR/Linalg.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
@@ -195,10 +196,9 @@ struct LowerViaMemory : mlir::OpRewritePattern<mlir::ktdf::ViaOp> {
         });
 
     rewriter.setInsertionPoint(via);
-    auto load = mlir::ktdp_lowering::LoadOp::create(
-        rewriter, via.getLoc(),
-        llvm::cast<mlir::RankedTensorType>(via.getType()), alloc, {},
-        type.getShape());
+    auto load = mlir::ktdp_lowering::LoadOp::create(rewriter, via.getLoc(),
+                                                    alloc, {}, type.getShape(),
+                                                    type.getElementType());
     load->setDiscardableAttrs(via->getRawDictionaryAttrs());
     rewriter.replaceOp(via, load);
     rewriter.modifyOpInPlace(stage, [&]() { stage.setDependsIn({token}); });
@@ -261,7 +261,7 @@ struct EraseStageMapping : mlir::OpRewritePattern<mlir::ktdf::StageOp> {
       break;
     }
 
-    auto inner = llvm::cast<mlir::scf::ForOp>(&*body.begin());
+    auto inner = llvm::dyn_cast<mlir::scf::ForOp>(&*body.begin());
     if (!inner) {
       break;
     }

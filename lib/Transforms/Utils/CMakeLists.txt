@@ -1,6 +1,7 @@
 add_dataflow_scheduler_library(DataflowSchedulerTransformUtils
     Hoisting.cpp
     IndirectAccessTileNarrowing.cpp
+    LoopSimplification.cpp
     PipelineTreeLegalizer.cpp
     RegionClonePrune.cpp
     SCFTilingUtils.cpp
@@ -21,15 +22,18 @@ add_dataflow_scheduler_library(DataflowSchedulerTransformUtils
     MLIRAffineAnalysis
     MLIRAffineDialect
     MLIRArithDialect
+    MLIRControlFlowInterfaces
     MLIRIR
     MLIRLinalgDialect
     MLIRLinalgTransforms
     MLIRLinalgUtils
+    MLIRLoopLikeInterface
     MLIRMemRefDialect
+    MLIRPresburger
     MLIRSCFDialect
     MLIRSCFUtils
-    MLIRTensorDialect
-    MLIRLoopLikeInterface
     MLIRSideEffectInterfaces
+    MLIRTensorDialect
+    MLIRValueBoundsOpInterface
     MLIRViewLikeInterface
 )

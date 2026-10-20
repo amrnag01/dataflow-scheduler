@@ -222,9 +222,12 @@ bool ComputeGroupExtractionPass::verifyComputeOpUses(mlir::Operation* op) {
     for (mlir::Operation* user : result.getUsers()) {
       if (mlir::isa<mlir::ktdp::StoreOp>(user)) {
         has_store_use = true;
-      } else if (llvm::isa<mlir::linalg::LinalgDialect>(user->getDialect()) ||
-                 llvm::isa<mlir::math::MathDialect>(user->getDialect()) ||
-                 llvm::isa<mlir::arith::ArithDialect>(user->getDialect())) {
+      } else if (llvm::isa_and_present<mlir::linalg::LinalgDialect>(
+                     user->getDialect()) ||
+                 llvm::isa_and_present<mlir::math::MathDialect>(
+                     user->getDialect()) ||
+                 llvm::isa_and_present<mlir::arith::ArithDialect>(
+                     user->getDialect())) {
         has_compute_use = true;
       }
     }
@@ -264,9 +267,12 @@ void ComputeGroupExtractionPass::buildAccessTileEqClasses(
       // classes of the access tiles of its ancestor loads.
       access_tile_eq_classes.insert(store_op.getAccessTile());
       unionAccessTilesFromAncestors(store_op, access_tile_eq_classes);
-    } else if (llvm::isa<mlir::linalg::LinalgDialect>(block_op.getDialect()) ||
-               llvm::isa<mlir::math::MathDialect>(block_op.getDialect()) ||
-               llvm::isa<mlir::arith::ArithDialect>(block_op.getDialect())) {
+    } else if (llvm::isa_and_present<mlir::linalg::LinalgDialect>(
+                   block_op.getDialect()) ||
+               llvm::isa_and_present<mlir::math::MathDialect>(
+                   block_op.getDialect()) ||
+               llvm::isa_and_present<mlir::arith::ArithDialect>(
+                   block_op.getDialect())) {
       assert(verifyComputeOpUses(&block_op) &&
              "Compute operation must have valid usage pattern");
     }

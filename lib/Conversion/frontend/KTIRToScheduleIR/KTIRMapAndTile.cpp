@@ -37,6 +37,7 @@
 #include <mlir/Interfaces/DestinationStyleOpInterface.h>
 #include <mlir/Interfaces/InferTypeOpInterface.h>
 #include <mlir/Interfaces/LoopLikeInterface.h>
+#include <mlir/Interfaces/ViewLikeInterface.h>
 #include <mlir/Pass/Pass.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 
@@ -47,12 +48,14 @@
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/DataTransferLowering.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
+#include "dataflow-scheduler/Dialect/KTDF/Utils/DataTransfers.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/Mapping.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchAttributes.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
+#include "dataflow-scheduler/Transforms/Utils/LoopSimplification.h"
 
 #define PASS_NAME "ktir-map-and-tile"
 #define DEBUG_TYPE PASS_NAME
@@ -157,8 +160,7 @@ auto determineTileSizes(mlir::linalg::LinalgOp op,
   const auto result_type =
       mlir::cast<mlir::RankedTensorType>(op->getResult(0).getType());
   if (!llvm::all_equal(op->getResultTypes())) {
-    // Current implementation only allows for uniform tiling of all results.
-    return op.emitError("tiling error: expected matching result types");
+    op.emitWarning("tiling heterogeneous results is not supported");
   }
 
   LDBG() << "determining tile sizes for "
@@ -216,30 +218,6 @@ auto determineTileSizes(mlir::linalg::LinalgOp op,
   return llvm::success();
 }
 
-auto reifySize(mlir::OpBuilder& builder, mlir::Location loc, mlir::Value value,
-               int64_t dim) -> mlir::FailureOr<mlir::OpFoldResult> {
-  if (auto result = llvm::dyn_cast<mlir::OpResult>(value); result) {
-    if (auto iface =
-            result.getDefiningOp<mlir::ReifyRankedShapedTypeOpInterface>();
-        iface) {
-      return iface.reifyDimOfResult(builder, result.getResultNumber(), dim);
-    }
-  }
-
-  const auto type = llvm::dyn_cast<mlir::RankedTensorType>(value.getType());
-  if (!type) {
-    return llvm::failure();
-  }
-
-  if (const auto size = type.getShape()[dim];
-      !mlir::ShapedType::isDynamic(size)) {
-    return mlir::OpFoldResult(builder.getI64IntegerAttr(size));
-  }
-
-  return mlir::OpFoldResult(
-      mlir::tensor::DimOp::create(builder, loc, value, dim));
-}
-
 auto compressInput(mlir::RewriterBase& rewriter, mlir::linalg::LinalgOp op,
                    mlir::OpOperand* input) -> llvm::LogicalResult {
   const auto type =
@@ -255,11 +233,9 @@ auto compressInput(mlir::RewriterBase& rewriter, mlir::linalg::LinalgOp op,
   llvm::SmallVector<mlir::Range> ranges;
   ranges.reserve(type.getRank());
   for (auto dim : llvm::iota_range<int64_t>(0, type.getRank(), false)) {
-    const auto size = reifySize(rewriter, op.getLoc(), input->get(), dim);
-    if (failed(size)) {
-      return llvm::failure();
-    }
-    ranges.push_back({zero, *size, one});
+    const auto size =
+        mlir::tensor::getMixedSize(rewriter, op.getLoc(), input->get(), dim);
+    ranges.push_back({zero, size, one});
   }
 
   for (auto dim : bcast_dims) {
@@ -342,201 +318,6 @@ auto tile(mlir::RewriterBase& rewriter, mlir::linalg::LinalgOp& op,
   });
 }
 
-struct TileLoad : mlir::OpRewritePattern<mlir::tensor::ExtractSliceOp> {
-  explicit TileLoad(mlir::MLIRContext* context,
-                    const AttrMapping& mem_space_map)
-      : OpRewritePattern(context), mem_space_map_(mem_space_map) {}
-
-  auto matchAndRewrite(mlir::tensor::ExtractSliceOp extract,
-                       mlir::PatternRewriter& rewriter) const
-      -> mlir::LogicalResult override {
-    auto source = llvm::dyn_cast<mlir::OpResult>(extract.getSource());
-    if (!source) {
-      return rewriter.notifyMatchFailure(extract, "no data tile source");
-    }
-
-    // Erase all the via hops on the way to the `ktdp.load`.
-    llvm::SmallVector<mlir::Attribute> reverse_hops;
-    auto load = llvm::dyn_cast<mlir::ktdp::LoadOp>(source.getOwner());
-    while (!load) {
-      if (auto via = llvm::dyn_cast<mlir::ktdf::ViaOp>(source.getOwner());
-          via) {
-        llvm::append_range(reverse_hops, llvm::reverse(via.getHops()));
-        source = llvm::dyn_cast<mlir::OpResult>(via.getOperand());
-        if (!source) {
-          return rewriter.notifyMatchFailure(via, "no data tile source");
-        }
-        if (via->hasOneUse()) {
-          rewriter.replaceOp(via, source);
-        }
-      } else {
-        return rewriter.notifyMatchFailure(source.getOwner(),
-                                           "not a data tile source");
-      }
-
-      load = llvm::dyn_cast<mlir::ktdp::LoadOp>(source.getOwner());
-    }
-
-    // Canonicalize the via hops, counting the load as a hop as well.
-    reverse_hops.push_back(getMemorySpace(load.getAccessTile()));
-    for (auto& hop : reverse_hops) {
-      hop = mem_space_map_.map(hop);
-    }
-    reverse_hops.erase(std::unique(reverse_hops.begin(), reverse_hops.end()),
-                       reverse_hops.end());
-
-    // Create the `ktdp_lowering.load` that captures the applied tiling.
-    auto new_load = mlir::ktdp_lowering::LoadOp::create(
-        rewriter, load.getLoc(), extract.getType(), load.getAccessTile(),
-        extract);
-    setThrottle(new_load, getThrottle(extract->getOpResult(0)));
-
-    // Add the hops back in after the load and replace `tensor.extract_slice`.
-    mlir::Value loaded = new_load.getResult();
-    if (auto reverse_via = llvm::MutableArrayRef(reverse_hops).drop_back(1);
-        !reverse_via.empty()) {
-      std::reverse(reverse_via.begin(), reverse_via.end());
-      loaded = mlir::ktdf::ViaOp::create(rewriter, load.getLoc(), loaded,
-                                         rewriter.getArrayAttr(reverse_via));
-    }
-    rewriter.replaceOp(extract, loaded);
-    if (load->use_empty()) {
-      rewriter.eraseOp(load);
-    }
-    return llvm::success();
-  }
-
- private:
-  const AttrMapping& mem_space_map_;
-};
-
-struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
-  explicit TileStore(mlir::MLIRContext* context,
-                     const AttrMapping& mem_space_map)
-      : OpRewritePattern(context), mem_space_map_(mem_space_map) {}
-
-  auto matchAndRewrite(mlir::ktdp::StoreOp store,
-                       mlir::PatternRewriter& rewriter) const
-      -> mlir::LogicalResult override {
-    auto source = llvm::dyn_cast<mlir::OpResult>(store.getDataTile());
-    if (!source) {
-      return rewriter.notifyMatchFailure(store, "no data tile source");
-    }
-
-    // Erase all the via hops on the way to the `tensor.insert_slice`.
-    mlir::scf::ForOp outermost;
-    llvm::SmallVector<mlir::Attribute> reverse_hops{
-        getMemorySpace(store.getAccessTile())};
-    auto insert_slice =
-        llvm::dyn_cast<mlir::tensor::InsertSliceOp>(source.getOwner());
-    while (!insert_slice) {
-      if (auto via = llvm::dyn_cast<mlir::ktdf::ViaOp>(source.getOwner());
-          via) {
-        llvm::append_range(reverse_hops, via.getHops());
-        source = llvm::dyn_cast<mlir::OpResult>(via.getOperand());
-        if (!source) {
-          return rewriter.notifyMatchFailure(via, "no data tile source");
-        }
-        if (via->hasOneUse()) {
-          rewriter.replaceOp(via, source);
-        }
-      } else if (auto loop =
-                     llvm::dyn_cast<mlir::scf::ForOp>(source.getOwner());
-                 loop) {
-        outermost = outermost ? outermost : loop;
-        source = llvm::dyn_cast<mlir::OpResult>(
-            loop.getBody()->getTerminator()->getOperand(
-                source.getResultNumber()));
-        if (!source) {
-          return rewriter.notifyMatchFailure(loop.getBody()->getTerminator(),
-                                             "no data tile source");
-        }
-      } else {
-        return rewriter.notifyMatchFailure(source.getOwner(),
-                                           "not a data tile source");
-      }
-
-      insert_slice =
-          llvm::dyn_cast<mlir::tensor::InsertSliceOp>(source.getOwner());
-    }
-
-    if (outermost) {
-      if (llvm::any_of(outermost->getUsers(),
-                       [&](mlir::Operation* user) -> bool {
-                         return user->isBeforeInBlock(store);
-                       })) {
-        return rewriter.notifyMatchFailure(outermost,
-                                           "loop has users before store");
-      }
-      rewriter.moveOpBefore(outermost, store);
-    }
-
-    // Canonicalize the via hops, counting the store as a hop as well.
-    for (auto& hop : reverse_hops) {
-      hop = mem_space_map_.map(hop);
-    }
-    reverse_hops.erase(std::unique(reverse_hops.begin(), reverse_hops.end()),
-                       reverse_hops.end());
-
-    // Determine the value to store. Conservatively, this must be the result of
-    // insert_slice, since we didn't check how that is computed.
-    mlir::Value stored = insert_slice.getResult();
-    if (auto loop = llvm::dyn_cast<mlir::LoopLikeOpInterface>(
-            insert_slice->getParentOp());
-        loop) {
-      auto dest_arg =
-          llvm::dyn_cast<mlir::BlockArgument>(insert_slice.getDest());
-      if (dest_arg && loop.getTiedLoopYieldedValue(dest_arg)->get() ==
-                          insert_slice.getResult()) {
-        // We know that insert_slice is a simple update on an iter_arg, which
-        // means it can be erased.
-        stored = insert_slice.getSource();
-        rewriter.replaceAllUsesWith(insert_slice.getResult(),
-                                    insert_slice.getDest());
-      }
-    }
-
-    // Add the hops back in before the store.
-    rewriter.setInsertionPointAfter(insert_slice);
-    if (auto reverse_via = llvm::MutableArrayRef(reverse_hops).drop_front(1);
-        !reverse_via.empty()) {
-      std::reverse(reverse_via.begin(), reverse_via.end());
-      stored = mlir::ktdf::ViaOp::create(rewriter, store.getLoc(), stored,
-                                         rewriter.getArrayAttr(reverse_via));
-    }
-
-    // Create the `ktdp_lowering.store` that captures the applied tiling.
-    auto new_store = mlir::ktdp_lowering::StoreOp::create(
-        rewriter, store.getLoc(), stored, store.getAccessTile(), insert_slice);
-    setThrottle(new_store, getThrottle(insert_slice.getSourceMutable()));
-    rewriter.eraseOp(store);
-    if (insert_slice->use_empty()) {
-      rewriter.eraseOp(insert_slice);
-    }
-    return llvm::success();
-  }
-
- private:
-  const AttrMapping& mem_space_map_;
-};
-
-void breakLoopCarriedDependencies(mlir::RewriterBase& rewriter,
-                                  mlir::DestinationStyleOpInterface op) {
-  rewriter.setInsertionPoint(op);
-  for (auto& outs : op.getDpsInitsMutable()) {
-    auto slice = outs.get().getDefiningOp<mlir::tensor::ExtractSliceOp>();
-    if (!slice || !llvm::isa<mlir::BlockArgument>(slice.getSource())) {
-      continue;
-    }
-
-    // FIMXE: This only works because we aren't tiling reduction dimensions!
-
-    rewriter.replaceOp(slice, mlir::tensor::EmptyOp::create(
-                                  rewriter, op.getLoc(), slice.getMixedSizes(),
-                                  slice.getType().getElementType()));
-  }
-}
-
 void bubbleOpExtractSlice(mlir::RewriterBase& rewriter,
                           mlir::tensor::ExtractSliceOp op,
                           const AttrMapping& mem_space_map) {
@@ -562,82 +343,107 @@ void bubbleOpExtractSlice(mlir::RewriterBase& rewriter,
   }
 }
 
-auto broadcastInput(mlir::RewriterBase& rewriter, mlir::linalg::LinalgOp op,
-                    mlir::OpOperand* input, const AttrMapping& mem_space_map)
-    -> llvm::LogicalResult {
-  const auto type =
-      llvm::dyn_cast<mlir::RankedTensorType>(input->get().getType());
-  const auto bcast_dims = op.getMatchingIndexingMap(input).getBroadcastDims();
-  if (!type || bcast_dims.empty()) {
-    return llvm::failure();
+[[nodiscard]] auto isBroadcast(mlir::Value value, int64_t dim) -> bool {
+  while (auto via = value.getDefiningOp<mlir::ktdf::ViaOp>()) {
+    value = via.getOperand();
   }
-
-  const auto vector_lanes =
-      op->getAttrOfType<mlir::ktdf_arch::I64Attr>(kThrottleAttrName).getValue();
-  const auto zero = rewriter.getI64IntegerAttr(0);
-  const auto one = rewriter.getI64IntegerAttr(1);
-
-  llvm::SmallVector<mlir::Range> ranges;
-  ranges.reserve(type.getRank());
-  int64_t elements = 1;
-  for (auto dim : llvm::iota_range<int64_t>(0, type.getRank(), false)) {
-    const auto size = reifySize(rewriter, op.getLoc(), input->get(), dim);
-    if (failed(size)) {
-      return llvm::failure();
-    }
-    ranges.push_back({zero, *size, one});
-
-    if (llvm::is_contained(bcast_dims, dim)) {
-      continue;
-    }
-    const auto static_size = mlir::getConstantIntValue(*size);
-    if (!static_size ||
-        llvm::MulOverflow(elements, *static_size, elements) != 0) {
-      return llvm::failure();
-    }
+  auto slice = value.getDefiningOp<mlir::OffsetSizeAndStrideOpInterface>();
+  if (!slice) {
+    return false;
   }
-
-  // The operand fills one vector, so only the lanes the other dimensions leave
-  // are spread along the innermost broadcast dimension. A broadcast outside the
-  // lanes keeps size 1.
-  if (elements <= 0 || vector_lanes % elements != 0) {
-    return llvm::failure();
+  const auto strides = slice.getMixedStrides();
+  if (static_cast<int64_t>(strides.size()) !=
+      llvm::cast<mlir::ShapedType>(value.getType()).getRank()) {
+    return false;
   }
-  const auto fill = vector_lanes / elements;
-  if (fill == 1) {
-    return llvm::failure();
-  }
-
-  for (auto dim : bcast_dims) {
-    ranges[dim] = {zero, one, zero};
-  }
-  ranges[bcast_dims.back()] = {zero, rewriter.getI64IntegerAttr(fill), zero};
-
-  auto broadcast = mlir::tensor::ExtractSliceOp::create(rewriter, op.getLoc(),
-                                                        input->get(), ranges);
-  input->set(broadcast);
-  bubbleOpExtractSlice(rewriter, broadcast, mem_space_map);
-  return llvm::success();
+  return mlir::isZeroInteger(strides[dim]) &&
+         !mlir::isConstantIntValue(slice.getMixedSizes()[dim], 1);
 }
 
-auto broadcastInputs(mlir::RewriterBase& rewriter, mlir::linalg::LinalgOp op,
-                     const AttrMapping& mem_space_map) -> llvm::LogicalResult {
-  rewriter.startOpModification(op);
-  auto changed = false;
+struct BroadcastInputs
+    : mlir::OpInterfaceRewritePattern<mlir::linalg::LinalgOp> {
+  explicit BroadcastInputs(mlir::MLIRContext* context,
+                           const AttrMapping& mem_space_map)
+      : OpInterfaceRewritePattern(context), mem_space_map_(mem_space_map) {}
 
-  for (auto* const input : op.getDpsInputOperands()) {
-    changed |= succeeded(broadcastInput(rewriter, op, input, mem_space_map));
+  auto matchAndRewrite(mlir::linalg::LinalgOp op,
+                       mlir::PatternRewriter& rewriter) const
+      -> mlir::LogicalResult override {
+    const auto throttle_attr =
+        op->getAttrOfType<mlir::ktdf_arch::I64Attr>(kThrottleAttrName);
+    if (!throttle_attr) {
+      return rewriter.notifyMatchFailure(op, "missing throttle attribute");
+    }
+    const auto vector_lanes = throttle_attr.getValue();
+    const auto zero = rewriter.getIndexAttr(0);
+    const auto one = rewriter.getIndexAttr(1);
+
+    rewriter.startOpModification(op);
+    auto changed = false;
+    for (auto* const input : op.getDpsInputOperands()) {
+      const auto type =
+          llvm::dyn_cast<mlir::RankedTensorType>(input->get().getType());
+      const auto bcast_dims =
+          op.getMatchingIndexingMap(input).getBroadcastDims();
+      if (!type || bcast_dims.empty() ||
+          bcast_dims.back() != type.getRank() - 1 ||
+          isBroadcast(input->get(), bcast_dims.back())) {
+        continue;
+      }
+
+      int64_t elements = 1;
+      for (auto [dim, size] : llvm::enumerate(type.getShape())) {
+        if (llvm::is_contained(bcast_dims, dim)) {
+          continue;
+        }
+        if (mlir::ShapedType::isDynamic(size) ||
+            llvm::MulOverflow(elements, size, elements) != 0) {
+          elements = 0;
+          break;
+        }
+      }
+
+      // The operand fills one vector, so only the lanes the other dimensions
+      // leave are spread along the innermost broadcast dimension. A broadcast
+      // outside the lanes keeps size 1.
+      if (elements <= 0 || vector_lanes % elements != 0) {
+        continue;
+      }
+      const auto fill = vector_lanes / elements;
+      if (fill == 1) {
+        continue;
+      }
+
+      auto sizes =
+          mlir::tensor::getMixedSizes(rewriter, op.getLoc(), input->get());
+      llvm::SmallVector<mlir::OpFoldResult> offsets(type.getRank(), zero);
+      llvm::SmallVector<mlir::OpFoldResult> strides(type.getRank(), one);
+      for (auto dim : bcast_dims) {
+        sizes[dim] = one;
+        strides[dim] = zero;
+      }
+      sizes[bcast_dims.back()] = rewriter.getIndexAttr(fill);
+
+      auto broadcast = mlir::tensor::ExtractSliceOp::create(
+          rewriter, op.getLoc(), input->get(), offsets, sizes, strides);
+      input->set(broadcast);
+      bubbleOpExtractSlice(rewriter, broadcast, mem_space_map_);
+      changed = true;
+    }
+
+    if (!changed) {
+      rewriter.cancelOpModification(op);
+      return rewriter.notifyMatchFailure(op, "nothing to broadcast");
+    }
+
+    LDBG() << "broadcasted " << mlir::OpWithFlags(op, kSkipRegions);
+    rewriter.finalizeOpModification(op);
+    return llvm::success();
   }
 
-  if (!changed) {
-    rewriter.cancelOpModification(op);
-    return llvm::failure();
-  }
-
-  LDBG() << "broadcasted " << mlir::OpWithFlags(op, kSkipRegions);
-  rewriter.finalizeOpModification(op);
-  return llvm::success();
-}
+ private:
+  const AttrMapping& mem_space_map_;
+};
 
 }  // namespace
 
@@ -695,7 +501,6 @@ void KTIRMapAndTilePass::runOnOperation() {
 
   // Tile all the compute operations and put them into loop nests that feature
   // loop-carried dependencies.
-  llvm::SmallVector<mlir::scf::LoopVector> loop_nests;
   for (auto& op : computes) {
     auto maybe_loops = tile(rewriter, op, mapping);
     if (failed(maybe_loops)) {
@@ -707,33 +512,24 @@ void KTIRMapAndTilePass::runOnOperation() {
              << mlir::OpWithFlags(op, kSkipRegions);
       continue;
     }
-
-    loop_nests.emplace_back(std::move(*maybe_loops));
-    // Break the loop carried `tensor.extract_slice` dependencies.
-    // FIXME: This is illegal if we're ever tiling across a reduction dimension.
-    breakLoopCarriedDependencies(rewriter, op);
   }
 
-  // Merge `tensor.(insert|extract)_slice` ops and tile `ktdp.(load|store)` and
-  // remove all the unneeded `iter_args`.
+  // Merge `tensor.(insert|extract)_slice` ops, tile `ktdp.(load|store)`,
+  // broadcast compute operands back to target vector size and remove all the
+  // unneeded `iter_args`.
   {
     mlir::RewritePatternSet patterns(&getContext());
-    patterns.add<TileLoad, TileStore>(patterns.getContext(), mem_space_map);
+    populateKTDPTilingPatterns(patterns, mem_space_map);
+    populateDataMovementCoalescingPatterns(patterns);
+    patterns.add<BroadcastInputs>(patterns.getContext(), mem_space_map);
     mlir::tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
-    mlir::populateRegionBranchOpInterfaceCanonicalizationPatterns(
-        patterns, mlir::scf::ForOp::getOperationName());
+    mlir::tensor::populateFoldTensorEmptyPatterns(patterns);
+    populateSimplifyLoopsPatterns(patterns);
 
-    if (failed(
-            mlir::applyPatternsGreedily(getOperation(), std::move(patterns)))) {
+    if (failed(mlir::applyPatternsGreedily(func, std::move(patterns)))) {
       signalPassFailure();
       return;
     }
-  }
-
-  // Broadcast compute operands back to target vector size.
-  for (auto op : computes) {
-    rewriter.setInsertionPoint(op);
-    std::ignore = broadcastInputs(rewriter, op, mem_space_map);
   }
 
   // Clean up all the unused function-level constants that remain.

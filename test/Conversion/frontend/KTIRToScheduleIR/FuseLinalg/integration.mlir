@@ -26,7 +26,7 @@
 // CHECK-NEXT:    %[[LOAD_2:.*]] = ktdp.load %[[CONSTRUCT_ACCESS_TILE_2]] : <1x64xindex> -> tensor<1x64xf16>
 // CHECK-NEXT:    %[[EMPTY_0:.*]] = tensor.empty() : tensor<1x64xf16>
 // CHECK-NEXT:    %[[EMPTY_1:.*]] = tensor.empty() : tensor<1x64xf16>
-// CHECK-NEXT:    %[[GENERIC_0:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_0]]], iterator_types = ["parallel", "parallel"]} ins(%[[LOAD_2]] : tensor<1x64xf16>) outs(%[[LOAD_2]] : tensor<1x64xf16>) attrs =  {ktdf_arch.maps_to = "SFU"} {
+// CHECK-NEXT:    %[[GENERIC_0:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_0]]], iterator_types = ["parallel", "parallel"]} ins(%[[LOAD_2]] : tensor<1x64xf16>) outs(%[[EMPTY_1]] : tensor<1x64xf16>) attrs =  {ktdf_arch.maps_to = "SFU"} {
 // CHECK-NEXT:    ^bb0(%[[VAL_0:.*]]: f16, %[[VAL_1:.*]]: f16):
 // CHECK-NEXT:      %[[SQRT_0:.*]] = math.sqrt %[[VAL_0]] {ktdf_arch.maps_to = "SFU"} : f16
 // CHECK-NEXT:      linalg.yield %[[SQRT_0]] : f16

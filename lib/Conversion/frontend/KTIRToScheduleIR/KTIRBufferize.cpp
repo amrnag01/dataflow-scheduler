@@ -22,6 +22,7 @@
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/DebugLog.h>
 #include <llvm/Support/LogicalResult.h>
+#include <mlir/Dialect/Affine/IR/AffineOps.h>
 #include <mlir/Dialect/Affine/Utils.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
@@ -42,9 +43,11 @@
 
 #include <limits>
 
-#include "Utils.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/DataTransferLowering.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"  // IWYU pragma: keep
+#include "dataflow-scheduler/Dialect/KTDF/KTDFDialect.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDF/Utils/DataTransfers.h"
+#include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
 #include "dataflow-scheduler/Transforms/Utils/IndirectAccessTileNarrowing.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
@@ -343,8 +346,8 @@ struct LowerLoad : mlir::OpRewritePattern<mlir::ktdp::LoadOp> {
     mixed_strides.assign(result_type.getRank(), rewriter.getIndexAttr(1));
 
     auto new_load = mlir::ktdp_lowering::LoadOp::create(
-        rewriter, load.getLoc(), result_type, source, mixed_offsets,
-        mixed_sizes, mixed_strides);
+        rewriter, load.getLoc(), source, mixed_offsets, mixed_sizes,
+        mixed_strides, result_type.getElementType());
     // Like a tiled load, transfer at the rate of the consuming computes.
     copyAttrsAndThrottle(load, new_load, getConsumerThrottle(load.getResult()));
     rewriter.replaceOp(load, new_load);
@@ -492,8 +495,9 @@ struct LowerTiledLoad : mlir::OpRewritePattern<mlir::ktdp_lowering::LoadOp> {
 
     // Rebuild the load with the cast memref as source, keeping the slice.
     auto new_load = mlir::ktdp_lowering::LoadOp::create(
-        rewriter, load.getLoc(), load.getType(), source,
-        mlir::cast<mlir::OffsetSizeAndStrideOpInterface>(load.getOperation()));
+        rewriter, load.getLoc(), load.getType(), source, load.getOffsets(),
+        load.getSizes(), load.getStrides(), load.getStaticOffsets(),
+        load.getStaticSizes(), load.getStaticStrides());
     new_load->setDiscardableAttrs(load->getRawDictionaryAttrs());
     rewriter.replaceOp(load, new_load);
 
@@ -559,8 +563,9 @@ struct LowerTiledStore : mlir::OpRewritePattern<mlir::ktdp_lowering::StoreOp> {
 
     // Rebuild the store with the cast memref as dest, keeping the slice.
     auto new_store = mlir::ktdp_lowering::StoreOp::create(
-        rewriter, store.getLoc(), store.getSource(), dest,
-        mlir::cast<mlir::OffsetSizeAndStrideOpInterface>(store.getOperation()));
+        rewriter, store.getLoc(), store.getSource(), dest, store.getOffsets(),
+        store.getSizes(), store.getStrides(), store.getStaticOffsets(),
+        store.getStaticSizes(), store.getStaticStrides());
     new_store->setDiscardableAttrs(store->getRawDictionaryAttrs());
     rewriter.eraseOp(store);
 

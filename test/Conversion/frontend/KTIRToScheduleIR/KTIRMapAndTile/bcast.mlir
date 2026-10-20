@@ -27,9 +27,8 @@
 // CHECK-NEXT:        scf.for %[[IV3:.+]] = %[[C0]] to %[[C64]] step %[[C1]] {
 // CHECK-NEXT:          scf.for %[[IV4:.+]] = %[[C0]] to %[[C64]] step %[[C64]] {
 // CHECK-DAG:             %[[LOAD_0:.+]] = ktdp_lowering.load %[[ACCTILE_0]][%[[IV0]], %[[IV2]], %[[IV3]], %[[IV4]]] [1, 1, 1, 64] [1, 1, 1, 1] {dataflow_scheduler.throttle = 64 : i64} : !ktdp.access_tile<12x1x64x64xindex> -> tensor<1x1x1x64xf16>
-// CHECK-DAG:             %[[LOAD_1:.+]] = ktdp_lowering.load %[[ACCTILE_1]][%[[IV0]], %[[IV2]], %[[IV3]], 0] [1, 1, 1, 1] [1, 1, 1, 0] {dataflow_scheduler.throttle = 64 : i64} : !ktdp.access_tile<12x1x64x64xindex> -> tensor<1x1x1x1xf16>
-// CHECK-DAG:             %[[BCAST:.+]] = tensor.extract_slice %[[LOAD_1]][0, 0, 0, 0] [1, 1, 1, 64] [1, 1, 1, 0] {ktdf_arch.maps_to = "DDR"} : tensor<1x1x1x1xf16> to tensor<1x1x1x64xf16>
-// CHECK-DAG:             %[[VIA:.+]] = ktdf.via["L1"] %[[BCAST]] : tensor<1x1x1x64xf16>
+// CHECK-DAG:             %[[LOAD_1:.+]] = ktdp_lowering.load %[[ACCTILE_1]][%[[IV0]], %[[IV2]], %[[IV3]], 0] [1, 1, 1, 64] [1, 1, 1, 0] {dataflow_scheduler.throttle = 64 : i64} : !ktdp.access_tile<12x1x64x64xindex> -> tensor<1x1x1x64xf16>
+// CHECK-DAG:             %[[VIA:.+]] = ktdf.via["L1"] %[[LOAD_1]] : tensor<1x1x1x64xf16>
 // CHECK:                 %[[GENERIC:.+]] = linalg.generic {indexing_maps = [#[[MAP2]], #[[MAP3]], #[[MAP1]]], iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]} 
 // CHECK-SAME:              ins(%[[LOAD_0]], %[[VIA]] : tensor<1x1x1x64xf16>, tensor<1x1x1x64xf16>)
 // CHECK-SAME:              attrs =  {dataflow_scheduler.throttle = 64 : i64, ktdf_arch.maps_to = "SFU"}

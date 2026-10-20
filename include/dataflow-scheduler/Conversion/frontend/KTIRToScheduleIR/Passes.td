@@ -84,7 +84,10 @@ def KTIRBufferizePass : Pass<"ktir-bufferize", "mlir::func::FuncOp"> {
         `reinterpret_cast`-only (no `memory_space_cast`).
   }];
   let dependentDialects = [
+    "mlir::affine::AffineDialect",
     "mlir::arith::ArithDialect",
+    "mlir::ktdf::KTDFDialect",
+    "mlir::ktdp_lowering::KTDPLoweringDialect",
     "mlir::memref::MemRefDialect"
   ];
 }
@@ -152,6 +155,7 @@ def KTIRPipelinePass : Pass<"ktir-pipeline", "mlir::func::FuncOp"> {
     ```
   }];
   let dependentDialects = [
+    "mlir::affine::AffineDialect",
     "mlir::ktdf::KTDFDialect",
     "mlir::ktdf_arch::KTDFArchDialect",
     "mlir::memref::MemRefDialect"

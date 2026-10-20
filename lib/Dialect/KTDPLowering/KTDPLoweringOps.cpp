@@ -31,6 +31,7 @@
 #include <llvm/Support/LogicalResult.h>
 #include <mlir/Dialect/Utils/StaticValueUtils.h>
 #include <mlir/IR/Builders.h>
+#include <mlir/IR/BuiltinTypes.h>
 #include <mlir/IR/Diagnostics.h>
 #include <mlir/IR/DialectImplementation.h>
 #include <mlir/IR/OpDefinition.h>
@@ -485,29 +486,32 @@ auto LoadOp::verify() -> LogicalResult {
   return success();
 }
 
-void LoadOp::build(OpBuilder& builder, OperationState& state,
-                   RankedTensorType result_type, Value source,
+void LoadOp::build(OpBuilder& builder, OperationState& state, Value source,
                    ArrayRef<OpFoldResult> mixed_offsets,
                    ArrayRef<OpFoldResult> mixed_sizes,
-                   ArrayRef<OpFoldResult> mixed_strides) {
+                   ArrayRef<OpFoldResult> mixed_strides, Type element_type) {
   const auto [static_offsets, offsets] = decomposeMixedValues(mixed_offsets);
   const auto [static_sizes, sizes] = decomposeMixedValues(mixed_sizes);
   const auto [static_strides, strides] = decomposeMixedValues(mixed_strides);
+  const auto result_type =
+      mlir::RankedTensorType::get(static_sizes, element_type);
+
   build(builder, state, result_type, source, offsets, sizes, strides,
         static_offsets, static_sizes, static_strides);
 }
 
-void LoadOp::build(OpBuilder& builder, OperationState& state,
-                   RankedTensorType result_type, Value source,
-                   OffsetSizeAndStrideOpInterface slice) {
-  build(builder, state, result_type, source, slice.getOffsets(),
-        slice.getSizes(), slice.getStrides(), slice.getStaticOffsets(),
-        slice.getStaticSizes(), slice.getStaticStrides());
+void LoadOp::build(OpBuilder& builder, OperationState& state, Value source,
+                   ArrayRef<Range> slice, Type element_type) {
+  const auto [offsets, sizes, strides] = mlir::getOffsetsSizesAndStrides(slice);
+
+  build(builder, state, source, offsets, sizes, strides, element_type);
 }
 
-void LoadOp::build(OpBuilder& builder, OperationState& state,
-                   RankedTensorType result_type, Value source, ValueRange sizes,
-                   ArrayRef<int64_t> static_sizes) {
+void LoadOp::build(OpBuilder& builder, OperationState& state, Value source,
+                   ValueRange sizes, ArrayRef<int64_t> static_sizes,
+                   Type element_type) {
+  const auto result_type =
+      mlir::RankedTensorType::get(static_sizes, element_type);
   const SmallVector<int64_t> static_offsets(result_type.getRank(), 0);
   const SmallVector<int64_t> static_strides(result_type.getRank(), 1);
 
@@ -515,12 +519,11 @@ void LoadOp::build(OpBuilder& builder, OperationState& state,
         static_sizes, static_strides);
 }
 
-void LoadOp::build(OpBuilder& builder, OperationState& state,
-                   RankedTensorType result_type, Value source,
-                   ArrayRef<OpFoldResult> mixed_sizes) {
+void LoadOp::build(OpBuilder& builder, OperationState& state, Value source,
+                   ArrayRef<OpFoldResult> mixed_sizes, Type element_type) {
   const auto [static_sizes, sizes] = decomposeMixedValues(mixed_sizes);
 
-  build(builder, state, result_type, source, sizes, static_sizes);
+  build(builder, state, source, sizes, static_sizes, element_type);
 }
 
 //===----------------------------------------------------------------------===//
@@ -553,15 +556,16 @@ void StoreOp::build(OpBuilder& builder, OperationState& state, Value source,
   const auto [static_offsets, offsets] = decomposeMixedValues(mixed_offsets);
   const auto [static_sizes, sizes] = decomposeMixedValues(mixed_sizes);
   const auto [static_strides, strides] = decomposeMixedValues(mixed_strides);
+
   build(builder, state, source, dest, offsets, sizes, strides, static_offsets,
         static_sizes, static_strides);
 }
 
 void StoreOp::build(OpBuilder& builder, OperationState& state, Value source,
-                    Value dest, OffsetSizeAndStrideOpInterface slice) {
-  build(builder, state, source, dest, slice.getOffsets(), slice.getSizes(),
-        slice.getStrides(), slice.getStaticOffsets(), slice.getStaticSizes(),
-        slice.getStaticStrides());
+                    Value dest, ArrayRef<Range> slice) {
+  const auto [offsets, sizes, strides] = mlir::getOffsetsSizesAndStrides(slice);
+
+  build(builder, state, source, dest, offsets, sizes, strides);
 }
 
 void StoreOp::build(OpBuilder& builder, OperationState& state, Value source,
