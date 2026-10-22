@@ -413,21 +413,39 @@ static void symbolizeLoopOrdering(
   llvm::DenseMap<const CandidateSetInfo*, SmallVector<Value>>
       candidateSetPositions;
 
-  // Step 1: For each candidate set, gather metadata and create position vars
+  // Step 1: For each candidate set, gather metadata and assert assumptions
   for (auto [candIdx, candidateSet] : llvm::enumerate(candidateSets)) {
     const auto& loops = candidateSet.loops;
     unsigned numLoops = loops.size();
 
-    // Map from original position (0..N-1) to LoopInfo
-    llvm::DenseMap<unsigned, LoopInfo> origLoopInfo;
+    // Verify all loops have lower bound 0 and step 1
     for (unsigned i = 0; i < numLoops; ++i) {
-      auto loop = loops[i];
-      origLoopInfo[i] = LoopInfo(
-          loop.getLowerBound(),
-          loop.getUpperBound(),
-          loop.getStep(),
-          loop.getInductionVar()
-      );
+      scf::ForOp loop = loops[i];
+
+      // Check lower bound is constant 0
+      Operation* lbOp = loop.getLowerBound().getDefiningOp();
+      auto lbConstOp = dyn_cast_or_null<arith::ConstantOp>(lbOp);
+      assert(lbConstOp && "Loop lower bound must be defined by arith.constant");
+      auto lbAttr = lbConstOp.getValue();
+      assert(isa<IntegerAttr>(lbAttr) &&
+             cast<IntegerAttr>(lbAttr).getValue().isZero() &&
+             "Loop lower bound must be constant 0");
+
+      // Check step is constant 1
+      Operation* stepOp = loop.getStep().getDefiningOp();
+      auto stepConstOp = dyn_cast_or_null<arith::ConstantOp>(stepOp);
+      assert(stepConstOp && "Loop step must be defined by arith.constant");
+      auto stepAttr = stepConstOp.getValue();
+      assert(isa<IntegerAttr>(stepAttr) &&
+             cast<IntegerAttr>(stepAttr).getValue() == 1 &&
+             "Loop step must be constant 1");
+    }
+
+    // Map from original position (0..N-1) to upper bounds
+    SmallVector<Value> originalUBs;
+    for (unsigned i = 0; i < numLoops; ++i) {
+      scf::ForOp loop = loops[i];
+      originalUBs.push_back(loop.getUpperBound());
     }
 
     // Step 2: Create position variables for this candidate set
@@ -446,17 +464,9 @@ static void symbolizeLoopOrdering(
 
     candidateSetPositions[&candidateSet] = positions;
 
-    // Step 3: Rewrite loop bounds and steps using select chains
-    // Collect the bounds/steps for all original loops
-    SmallVector<Value> lbs, ubs, steps;
-    for (unsigned origIdx = 0; origIdx < numLoops; ++origIdx) {
-      lbs.push_back(origLoopInfo[origIdx].lowerBound);
-      ubs.push_back(origLoopInfo[origIdx].upperBound);
-      steps.push_back(origLoopInfo[origIdx].step);
-    }
-
+    // Step 3: Rewrite loop upper bounds using select chains
     // Build nested select chain for each position:
-    // For loop at position i: select(pos[i]==0, val[0], select(pos[i]==1, val[1], ..., val[N-1]))
+    // For loop at position i: select(pos[i]==0, ub[0], select(pos[i]==1, ub[1], ..., ub[N-1]))
     auto buildSelectChain = [&](Value posVar, ArrayRef<Value> bounds) -> Value {
       // Start from the end as default, then build the chain forward
       Value result = bounds.back();
@@ -472,16 +482,13 @@ static void symbolizeLoopOrdering(
       return result;
     };
 
-    // Apply to all loops - each loop uses its corresponding position variable
+    // Apply to all loops - each loop's upper bound uses its corresponding position variable
     for (unsigned loopIdx = 0; loopIdx < numLoops; ++loopIdx) {
-      Value newLB = buildSelectChain(positions[loopIdx], lbs);
-      Value newUB = buildSelectChain(positions[loopIdx], ubs);
-      Value newStep = buildSelectChain(positions[loopIdx], steps);
+      Value newUB = buildSelectChain(positions[loopIdx], originalUBs);
 
       scf::ForOp loop = loops[loopIdx];
-      loop.setLowerBound(newLB);
       loop.setUpperBound(newUB);
-      loop.setStep(newStep);
+      // Lower bound and step remain 0 and 1 respectively (unchanged)
     }
 
     // Step 4: Insert arg selection trees in the innermost loop body
