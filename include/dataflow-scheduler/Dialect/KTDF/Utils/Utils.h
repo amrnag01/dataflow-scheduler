@@ -121,15 +121,19 @@ auto convertTensorUsesToMemref(
 
 /// Re-emit a tensor-typed `ktdf.read_from_fifo` as a memref-typed one.
 ///
-/// Inserts a new `ktdf.read_from_fifo` at `builder`'s insertion point that
+/// Inserts a new `ktdf.read_from_fifo` immediately before `read_op` that
 /// produces a plain (no layout, no memory space) `memref` of the same shape and
 /// element type as the original tensor result.  The original op is NOT erased;
 /// the caller is responsible for removing it once its uses are gone.
 ///
+/// The new read takes the original's place rather than `builder`'s insertion
+/// point: slots that share a physical FIFO are drained in program order, so
+/// moving a read past a sibling's swaps the values the two receive.
+///
 /// A splat mode the original carries is carried over: reading the slot as a
 /// buffer does not perform the shuffle it names, so the new read still owes it.
 ///
-/// \param builder  OpBuilder positioned at the desired insertion point.
+/// \param builder  OpBuilder to create with; its insertion point is restored.
 /// \param read_op  The tensor-typed read_from_fifo to convert.
 /// \return         The memref-typed result Value of the new read.
 auto convertFromTensorToMemref(mlir::OpBuilder& builder,

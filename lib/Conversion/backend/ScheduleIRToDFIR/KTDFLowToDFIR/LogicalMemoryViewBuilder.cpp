@@ -79,13 +79,16 @@ llvm::SetVector<ResourceType> discoverAndPrune(mlir::func::FuncOp func) {
     llvm::SmallVector<mlir::Operation*> to_prune;
 
     pu.getRegion().front().walk([&](mlir::Operation* op) {
-      // Source A: ktdp.construct_memory_view — get memory space from the
-      // downstream memory_space_cast result type.
+      // Source A: ktdp.construct_memory_view — get memory space from
+      // downstream memory_space_cast or from result type for direct users.
       if (auto cmv = mlir::dyn_cast<mlir::ktdp::ConstructMemoryViewOp>(op)) {
         for (mlir::Operation* user : cmv.getResult().getUsers()) {
           if (auto msc =
                   mlir::dyn_cast<mlir::memref::MemorySpaceCastOp>(user)) {
             if (auto ms = getMemorySpaceAttr(msc.getDest().getType()))
+              needed.insert(llvm::cast<ResourceType>(*ms));
+          } else if (!mlir::isa<mlir::memref::ReinterpretCastOp>(user)) {
+            if (auto ms = getMemorySpaceAttr(cmv.getResult().getType()))
               needed.insert(llvm::cast<ResourceType>(*ms));
           }
         }
@@ -226,6 +229,31 @@ mlir::FailureOr<int64_t> wordSizeOf(
   return word_size.value_or(1);
 }
 
+/// Walks forward from @p view_like through single-use ViewLikeOpInterface ops.
+/// Collects the ops of the chain into @p intermediates , head first, and
+/// captures its first reinterpret_cast, if any, into @p rc for offset
+/// extraction. Returns the tail of the chain.
+mlir::Value walkViewChain(
+    mlir::ViewLikeOpInterface view_like,
+    llvm::SmallVectorImpl<mlir::Operation*>& intermediates,
+    mlir::memref::ReinterpretCastOp& rc) {
+  rc =
+      mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(view_like.getOperation());
+  mlir::Value cursor = view_like.getViewDest();
+  intermediates.push_back(view_like.getOperation());
+  while (cursor.hasOneUse()) {
+    mlir::Operation* user = *cursor.getUsers().begin();
+    auto view = mlir::dyn_cast<mlir::ViewLikeOpInterface>(user);
+    if (!view)
+      break;
+    else if (!rc)
+      rc = mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(user);
+    intermediates.push_back(user);
+    cursor = view.getViewDest();
+  }
+  return cursor;
+}
+
 /// Phase 3b: replace Source A chains with get_logical_memory_view.
 /// Emits the view op and RAUWs the chain tail inline; does not populate
 /// `replacements` (Source A handles its own erasure).
@@ -271,35 +299,11 @@ mlir::LogicalResult replaceSourceAChains(
     auto plain_type =
         mlir::MemRefType::get(src_type.getShape(), src_type.getElementType());
 
-    // Collect all ViewLikeOpInterface users up front so we can iterate safely
-    // while modifying the use-list.
-    llvm::SmallVector<mlir::ViewLikeOpInterface> users;
-    for (auto* user : cmv.getResult().getUsers()) {
-      if (auto viewLikeOp = mlir::dyn_cast<mlir::ViewLikeOpInterface>(user))
-        users.push_back(viewLikeOp);
-    }
-    if (users.empty())
-      return cmv.emitError(
-          "construct_memory_view: no ViewLikeOpInterface users found");
-
-    for (auto viewLikeOp : users) {
-      // Walk forward through ViewLikeOpInterface ops, capturing rc if present
-      // for offset extraction.
-      mlir::memref::ReinterpretCastOp rc;
-      mlir::Value cursor = viewLikeOp.getViewDest();
-      llvm::SmallVector<mlir::Operation*> intermediates;
-      intermediates.push_back(viewLikeOp.getOperation());
-      while (cursor.hasOneUse()) {
-        mlir::Operation* user = *cursor.getUsers().begin();
-        auto view = mlir::dyn_cast<mlir::ViewLikeOpInterface>(user);
-        if (!view)
-          break;
-        else if (!rc)
-          rc = mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(user);
-        intermediates.push_back(user);
-        cursor = view.getViewDest();
-      }
-
+    // Lower a single view use chain (or direct use if cursor ==
+    // cmv.getResult()).
+    auto lowerViewChain =
+        [&](mlir::Value cursor, llvm::ArrayRef<mlir::Operation*> intermediates,
+            mlir::memref::ReinterpretCastOp rc) -> mlir::LogicalResult {
       // Emitting the view, once the start address is settled -- shared by the
       // symbolic path and the constant one, which arrive at that address in
       // quite different ways but say the same thing with it.
@@ -386,8 +390,7 @@ mlir::LogicalResult replaceSourceAChains(
             definitions, cmv.getLoc());
         if (mlir::failed(symbolic)) return mlir::failure();
 
-        if (mlir::failed(emitView(*symbolic))) return mlir::failure();
-        continue;
+        return emitView(*symbolic);
       }
 
       // Compute start_address = base_addr + reinterpret_offset, where the
@@ -453,7 +456,7 @@ mlir::LogicalResult replaceSourceAChains(
           // After the view, which erases the chain holding the last use of the
           // arithmetic the address was read out of.
           eraseDeadAncestorOps({in_bytes.getDefiningOp()});
-          continue;
+          return mlir::success();
         }
 
         // No run input in it, so the sum stands as the address and the
@@ -464,7 +467,32 @@ mlir::LogicalResult replaceSourceAChains(
         element_size.getDefiningOp()->erase();
       }
 
-      if (mlir::failed(emitView(start_address))) return mlir::failure();
+      return emitView(start_address);
+    };
+
+    // Collect all ViewLikeOpInterface users up front so we can iterate safely
+    // while modifying the use-list.
+    llvm::SmallVector<mlir::ViewLikeOpInterface> users;
+    for (auto* user : cmv.getResult().getUsers()) {
+      if (auto viewLikeOp = mlir::dyn_cast<mlir::ViewLikeOpInterface>(user))
+        users.push_back(viewLikeOp);
+    }
+
+    for (auto viewLikeOp : users) {
+      // Walk forward through ViewLikeOpInterface ops, capturing rc if present
+      // for offset extraction.
+      mlir::memref::ReinterpretCastOp rc;
+      llvm::SmallVector<mlir::Operation*> intermediates;
+      mlir::Value cursor = walkViewChain(viewLikeOp, intermediates, rc);
+      if (mlir::failed(lowerViewChain(cursor, intermediates, rc)))
+        return mlir::failure();
+    }
+
+    // Direct users get the view directly using the result type's memory space.
+    if (!cmv.getResult().use_empty()) {
+      if (mlir::failed(lowerViewChain(cmv.getResult(), /*intermediates=*/{},
+                                      /*rc=*/nullptr)))
+        return mlir::failure();
     }
 
     // All chains sourced from this cmv have been replaced; erase it now.
@@ -474,9 +502,11 @@ mlir::LogicalResult replaceSourceAChains(
 }
 
 /// Replace all ktdp_lowering.construct_memory_view ops inside \p pu with
-/// dataflow.get_logical_memory_view. Unlike the ktdp variant these ops have no
-/// ViewLikeOpInterface chain: the memory space is encoded directly on the
-/// result type and the result is used directly by downstream agen ops.
+/// dataflow.get_logical_memory_view. Unlike the ktdp variant the memory space
+/// is encoded directly on the result type. The result may be used directly, or
+/// through a ViewLikeOpInterface chain (e.g. the reinterpret_cast and
+/// memref.cast that bufferization puts on an IAB). Each such chain is replaced
+/// by its own view, displaced by the chain's reinterpret_cast offset.
 static mlir::LogicalResult replaceLoweringConstructMemoryViewOps(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::DenseMap<ResourceType, mlir::Value>& resolved_units,
@@ -518,11 +548,52 @@ static mlir::LogicalResult replaceLoweringConstructMemoryViewOps(
     auto plain_type =
         mlir::MemRefType::get(src_type.getShape(), src_type.getElementType());
 
-    builder.setInsertionPointAfter(cmv);
-    auto view_op = mlir::dataflow::GetLogicalMemoryViewOp::create(
-        builder, cmv.getLoc(), plain_type, unit, cmv.getOffset(),
-        mlir::AffineMapAttr::get(layout_map));
-    cmv.getResult().replaceAllUsesWith(view_op.getData());
+    llvm::SmallVector<mlir::ViewLikeOpInterface> chains;
+    for (auto* user : cmv.getResult().getUsers()) {
+      if (auto view_like = mlir::dyn_cast<mlir::ViewLikeOpInterface>(user))
+        chains.push_back(view_like);
+    }
+
+    for (auto view_like : chains) {
+      mlir::memref::ReinterpretCastOp rc;
+      llvm::SmallVector<mlir::Operation*> intermediates;
+      mlir::Value cursor = walkViewChain(view_like, intermediates, rc);
+
+      // start_address = base_addr + reinterpret_offset, both in elements.
+      builder.setInsertionPointAfter(cursor.getDefiningOp());
+      mlir::Value start_address = cmv.getOffset();
+      if (rc) {
+        const auto offset = rc.getConstifiedMixedOffset();
+        if (auto offset_val = llvm::dyn_cast<mlir::Value>(offset)) {
+          start_address = mlir::arith::AddIOp::create(
+              builder, cmv.getLoc(), start_address, offset_val);
+        } else if (const int64_t offset_cst =
+                       llvm::cast<mlir::IntegerAttr>(
+                           llvm::cast<mlir::Attribute>(offset))
+                           .getInt();
+                   offset_cst != 0) {
+          start_address = mlir::arith::AddIOp::create(
+              builder, cmv.getLoc(), start_address,
+              mlir::arith::ConstantIndexOp::create(builder, cmv.getLoc(),
+                                                   offset_cst));
+        }
+      }
+
+      auto view_op = mlir::dataflow::GetLogicalMemoryViewOp::create(
+          builder, cmv.getLoc(), plain_type, unit, start_address,
+          mlir::AffineMapAttr::get(layout_map));
+      cursor.replaceAllUsesWith(view_op.getData());
+      for (auto* op : llvm::reverse(intermediates)) op->erase();
+    }
+
+    // Direct users get the undisplaced view.
+    if (!cmv.getResult().use_empty()) {
+      builder.setInsertionPointAfter(cmv);
+      auto view_op = mlir::dataflow::GetLogicalMemoryViewOp::create(
+          builder, cmv.getLoc(), plain_type, unit, cmv.getOffset(),
+          mlir::AffineMapAttr::get(layout_map));
+      cmv.getResult().replaceAllUsesWith(view_op.getData());
+    }
     cmv.erase();
   }
   return mlir::success();
@@ -615,9 +686,9 @@ mlir::LogicalResult replaceSourceBCasts(
 
     // If the ucc result flows through a memref.cast (e.g., dynamizing dims for
     // select_memref), RAUW the cast's result with the view now and erase the
-    // cast so that propagateTypes only ever sees data_transfer/select_memref
-    // as consumers of ucc_result. Also update select_memref result types whose
-    // operand type changed.
+    // cast so that propagateTypes only ever sees (ind_)data_transfer or
+    // select_memref as consumers of ucc_result. Also update select_memref
+    // result types whose operand type changed.
     mlir::Value ucc_result = ucc.getOutputs()[0];
     for (auto* user : llvm::make_early_inc_range(ucc_result.getUsers())) {
       if (auto mc = mlir::dyn_cast<mlir::memref::CastOp>(user)) {
@@ -639,7 +710,8 @@ mlir::LogicalResult replaceSourceBCasts(
 }
 
 /// Phase 3d: RAUW old values with new get_logical_memory_view results and
-/// propagate plain-memref types through select_memref and data_transfer.
+/// propagate plain-memref types through select_memref and
+/// (ind_)data_transfer.
 mlir::LogicalResult propagateTypes(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::DenseMap<mlir::Value, mlir::Value>& replacements,
@@ -648,8 +720,9 @@ mlir::LogicalResult propagateTypes(
     llvm::SmallVector<mlir::Operation*> users(old_val.getUsers().begin(),
                                               old_val.getUsers().end());
     for (auto* user : users) {
-      if (auto dt = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(user)) {
-        dt->replaceUsesOfWith(old_val, new_val);
+      if (mlir::isa<mlir::ktdf::DataTransferOp, mlir::ktdf::IndDataTransferOp>(
+              user)) {
+        user->replaceUsesOfWith(old_val, new_val);
       } else if (auto sel = mlir::dyn_cast<mlir::ktdf::SelectMemrefOp>(user)) {
         sel->replaceUsesOfWith(old_val, new_val);
         // All operands of select_memref have the same element type; use the
@@ -657,10 +730,11 @@ mlir::LogicalResult propagateTypes(
         sel.getResult().setType(
             mlir::cast<mlir::MemRefType>(new_val.getType()));
         for (auto* sel_user : sel.getResult().getUsers()) {
-          if (!mlir::isa<mlir::ktdf::DataTransferOp>(sel_user))
+          if (!mlir::isa<mlir::ktdf::DataTransferOp,
+                         mlir::ktdf::IndDataTransferOp>(sel_user))
             return sel.emitError(
                 "select_memref result used by unexpected op; expected "
-                "data_transfer");
+                "data_transfer or ind_data_transfer");
         }
       } else {
         // Sub-scratchpad spaces (e.g. SFU_REG) are register-file buffers
@@ -673,7 +747,7 @@ mlir::LogicalResult propagateTypes(
         } else {
           return pu.emitError(
               "unexpected consumer of memory view; expected "
-              "data_transfer or select_memref");
+              "data_transfer, ind_data_transfer or select_memref");
         }
       }
     }

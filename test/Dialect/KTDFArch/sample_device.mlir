@@ -66,6 +66,10 @@
   }
 }
 
+#MPE_ARRAY = {
+  kind = "MPE_ARRAY"
+}
+
 #SFU_REG = {
   kind = "SFU_REG",
   size = 2048 //2KB
@@ -152,6 +156,8 @@ ktdf_arch.device @sample_device {
          yield %sfp_unit
       } -> exec_unit
 
+      %mpe_array = exec_unit #MPE_ARRAY
+
       // L1 Load/Store units.
       %l1lu = exec_unit #L1LU
       %l1su = exec_unit #L1SU
@@ -172,6 +178,8 @@ ktdf_arch.device @sample_device {
          yield %sfp_unit
       } -> exec_unit
 
+      %mpe_array = exec_unit #MPE_ARRAY
+
       // L1 Load/Store units.
       %l1lu = exec_unit #L1LU
       %l1su = exec_unit #L1SU
@@ -181,6 +189,22 @@ ktdf_arch.device @sample_device {
       datapath #L1LU_SUBCORE_FIFO %l1lu to %sfu : exec_unit, exec_unit
       datapath #L1SU_SUBCORE_FIFO %sfu to %l1su : exec_unit, exec_unit
       datapath #L1SU_CORE_FIFO %l1su to %l1 : exec_unit, memory
+    }
+  }
+
+  patterns ["pre_mapping"] {
+    // Maps all contractions to the MPE array.
+    pdl.pattern : benefit(1) {
+      %operands = operands
+      %results = types
+      %contraction = operation "linalg.generic" (%operands : !pdl.range<value>) -> (%results : !pdl.range<type>)
+      apply_native_constraint "linalg.is_contraction"(%contraction : !pdl.operation)
+      apply_native_constraint "ktdf_arch.mapped_to" (%contraction: !pdl.operation) : !pdl.attribute {isNegated = true}
+
+      rewrite {
+        %mpe_array = pdl.attribute = "MPE_ARRAY"
+        apply_native_rewrite "ktdf_arch.map_to"(%contraction, %mpe_array : !pdl.operation, !pdl.attribute)
+      }
     }
   }
 

@@ -80,6 +80,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <mlir/Dialect/Linalg/IR/LinalgInterfaces.h>
+
 #include <memory>
 
 #include "dataflow-scheduler/Analysis/ArchViews/GroupLocalMemory.h"
@@ -999,6 +1001,11 @@ struct MapReductionPartialsPass
     // ins[0] to already be a memref).
     SmallVector<linalg::GenericOp> loop_exposed, inner_dim;
     module.walk([&](linalg::GenericOp generic_op) {
+      // FIXME: Current implementation leads to invalid IR when processing
+      //        contractions, so skip them for now to allow matmul to pass.
+      if (linalg::isaContractionOpInterface(generic_op)) {
+        return;
+      }
       if (!hasReductionIterator(generic_op)) return;
       if (generic_op.getOutputs().empty()) return;
       auto iter_arg = dyn_cast<BlockArgument>(generic_op.getOutputs()[0]);

@@ -711,7 +711,7 @@ LogicalResult StageCoarseningPass::GenerateTransformedIR(
 
   LDBG(1) << "\n--- Cleaning Up Private Ops ---";
   mlir::IRRewriter rewriter(new_outer_pipeline_op);
-  mlir::ktdf::PipelinePrivatizer::canonicalize(rewriter, new_outer_pipeline_op);
+  mlir::ktdf::PrivateBuilder::canonicalize(rewriter, new_outer_pipeline_op);
 
   LDBG_OS(1, [&](llvm::raw_ostream& os) {
     os << "IR after private cleanup:\n";

@@ -56,6 +56,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <mlir/Dialect/Linalg/IR/LinalgInterfaces.h>
+
 #include <memory>
 #include <optional>
 
@@ -113,6 +115,13 @@ struct ReductionInfo {
 // ---------------------------------------------------------------------------
 static bool collectReductionInfo(linalg::GenericOp generic_op,
                                  ReductionInfo& info) {
+  // FIXME: Current implementation leads to invalid IR when processing
+  //        contractions, so skip them for now to allow matmul to pass.
+  if (linalg::isaContractionOpInterface(generic_op)) {
+    LDBG() << "ignoring contraction";
+    return false;
+  }
+
   std::optional<unsigned> inner_dim = ktdf::findInnerDimLoopDim(generic_op);
 
   auto input_type =

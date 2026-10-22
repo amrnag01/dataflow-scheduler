@@ -18,6 +18,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <mlir/Dialect/Linalg/IR/LinalgInterfaces.h>
+
 #include <memory>
 
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
@@ -129,6 +131,13 @@ static bool isEligible(linalg::GenericOp generic_op) {
   unsigned last = input_map.getNumResults() - 1;
   auto dim_expr = dyn_cast<AffineDimExpr>(input_map.getResult(last));
   if (!dim_expr) return false;
+
+  // FIXME: Current implementation leads to invalid IR when processing
+  //        contractions, so skip them for now to allow matmul to pass.
+  if (linalg::isaContractionOpInterface(generic_op)) {
+    LDBG() << "ignoring contraction";
+    return false;
+  }
 
   return iter_types[dim_expr.getPosition()] == utils::IteratorType::reduction;
 }

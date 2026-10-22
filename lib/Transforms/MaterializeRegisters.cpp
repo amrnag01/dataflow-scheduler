@@ -31,13 +31,13 @@
 #include <mlir/Pass/Pass.h>
 #include <mlir/Transforms/RegionUtils.h>
 
-#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/Mapping.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchInterfaces.h"
 #include "dataflow-scheduler/Transforms/Passes.h"  // IWYU pragma: keep
+#include "dataflow-scheduler/Transforms/Utils/Utils.h"
 
 namespace scheduler {
 #define GEN_PASS_DEF_MATERIALIZEREGISTERSPASS

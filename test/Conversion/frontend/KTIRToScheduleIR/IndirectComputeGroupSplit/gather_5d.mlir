@@ -66,7 +66,7 @@
 // -- 5D IAB memory view
 // CHECK:           ktdp_lowering.construct_memory_view
 // CHECK-SAME:        "IAB"
-// CHECK-SAME:        memref<2x4x3x2x8xindex, "IAB">
+// CHECK-SAME:        memref<2x4x3x2x8xi32, "IAB">
 // -- global 5D addr buf CMV for loading into IAB
 // CHECK:           ktdp.construct_memory_view {{.*}}, sizes: [2, 4, 3, 2, 8], strides: [192, 48, 16, 8, 1]
 // CHECK-SAME:        memory_space = #ktdp.memory_space<global>

@@ -73,10 +73,10 @@
 // CHECK-NEXT:           } {applicable_units = ["SFU"]}
 // CHECK-NEXT:           ktdf.stage depends_in(%[[VAL_8:.*]]#8) depends_out(%[[VAL_8]]#9) {
 // CHECK-NEXT:             ktdf.data_transfer from %[[VAL_8]]#1 size [64] to %[[VAL_8]]#0{{\[}}%[[VAL_0]], %[[VAL_1]]] size [1, 64] : !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, memref<1x64xf16, "L1">
-// CHECK-NEXT:           }
+// CHECK-NEXT:           } {applicable_units = ["L1SU"]}
 // CHECK-NEXT:           ktdf.stage depends_in(%[[VAL_9:.*]]#9) depends_out(none) {
 // CHECK-NEXT:             ktdf.data_transfer from %[[VAL_9]]#0{{\[}}%[[CONSTANT_8]], %[[CONSTANT_8]]] size [1, 64] to %[[REINTERPRET_CAST_2]]{{\[}}%[[VAL_0]], %[[VAL_1]]] size [1, 64] : memref<1x64xf16, "L1">, memref<1x64xf16, strided<[64, 1], offset: ?>, "DDR">
-// CHECK-NEXT:           }
+// CHECK-NEXT:           } {applicable_units = ["MNISU"]}
 // CHECK-NEXT:         }
 // CHECK-NEXT:       } {loop_type = #ktdf.loop_type<parallel_loop>}
 // CHECK-NEXT:     } {loop_type = #ktdf.loop_type<parallel_loop>}

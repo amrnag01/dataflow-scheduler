@@ -26,22 +26,12 @@
 #include <mlir/IR/BuiltinTypes.h>
 #include <mlir/IR/PatternMatch.h>
 
-#include "dataflow-scheduler/Dialect/Agen/Agen.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Utils.h"
-#include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
-#include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 
 using namespace scheduler;
-
-int64_t scheduler::getVectorLanes(mlir::Type elem_type,
-                                  mlir::ktdf_arch::ExecutionUnitOp compute) {
-  return std::max(
-      compute.getFeature<mlir::ktdf_arch::feature::SIMD>().getLanes(elem_type),
-      static_cast<int64_t>(1));
-}
 
 auto scheduler::getFlattenedVectorType(mlir::ShapedType type)
     -> mlir::VectorType {

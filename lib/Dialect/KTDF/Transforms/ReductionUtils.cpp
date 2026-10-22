@@ -118,7 +118,7 @@ FifoPrivateResult StageFactory::buildFifoPrivate(
 void StageFactory::buildLoadStage(
     Value condition, Value input_memref, MemRefType input_memref_type,
     Value partial_memref, MemRefType output_memref_type,
-    ArrayRef<int64_t> reduction_dims, ArrayRef<int64_t> chunk_sizes,
+    ArrayRef<unsigned> reduction_dims, ArrayRef<int64_t> chunk_sizes,
     ArrayRef<Value> dim_ivs, const ChunkPipelineConfig& cfg) {
   // token 0: Load → Compute synchronisation (ChunkPipelineConfig convention).
   auto stage =

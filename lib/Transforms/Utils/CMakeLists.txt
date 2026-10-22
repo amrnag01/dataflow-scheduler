@@ -1,7 +1,7 @@
 add_dataflow_scheduler_library(DataflowSchedulerTransformUtils
-    CustomLinalgTiling.cpp
     Hoisting.cpp
     IndirectAccessTileNarrowing.cpp
+    LoopSimplification.cpp
     PipelineTreeLegalizer.cpp
     RegionClonePrune.cpp
     SCFTilingUtils.cpp
@@ -15,21 +15,25 @@ add_dataflow_scheduler_library(DataflowSchedulerTransformUtils
     DataflowScheduler::KTDPLoweringDialect
     DataflowSchedulerDialects::DataflowDialect
     DataflowSchedulerDialects::KTDFDialect
+    DataflowSchedulerDialects::KTDFArchDialect
     DataflowSchedulerDialects::KTDFTransforms
 
   LINK_MLIR_LIBS PUBLIC
     MLIRAffineAnalysis
     MLIRAffineDialect
     MLIRArithDialect
+    MLIRControlFlowInterfaces
     MLIRIR
     MLIRLinalgDialect
     MLIRLinalgTransforms
     MLIRLinalgUtils
+    MLIRLoopLikeInterface
     MLIRMemRefDialect
+    MLIRPresburger
     MLIRSCFDialect
     MLIRSCFUtils
-    MLIRTensorDialect
-    MLIRLoopLikeInterface
     MLIRSideEffectInterfaces
+    MLIRTensorDialect
+    MLIRValueBoundsOpInterface
     MLIRViewLikeInterface
 )

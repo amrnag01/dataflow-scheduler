@@ -17,7 +17,7 @@
 // CHECK-NEXT:      ktdf.data_transfer from %{{.*}}[0, 0] size [2, 64] to %[[PRV]]#0[0, 0] size [2, 64]
 // CHECK-NEXT:      %[[EQ:.+]] = arith.cmpi eq, %[[IV:.+]], %[[C0:.+]] : index
 // CHECK-NEXT:      scf.if %[[EQ]] {
-// CHECK-NEXT:        ktdf.data_transfer from %[[ADDR_BUF:.+]]{{\[}}%[[C0]]] size [32] to %[[PRV]]#8[0] size [32] : memref<32xindex, strided<[1], offset: ?>, "DDR">, memref<32xindex, "L1">
+// CHECK-NEXT:        ktdf.data_transfer from %[[ADDR_BUF:.+]]{{\[}}%[[C0]]] size [32] to %[[PRV]]#8[0] size [32] {dataflow_scheduler.throttle = 1 : i64} : memref<32xindex, strided<[1], offset: ?>, "DDR">, memref<32xindex, "L1">
 // CHECK-NEXT:      }
 // CHECK-NEXT:    } {applicable_units = ["MNILU"]}
 
@@ -25,7 +25,7 @@
 // CHECK:         ktdf.stage depends_in(%[[PRV]]#7) depends_out(none) {
 // CHECK-NEXT:      %[[EQ_ST:.+]] = arith.cmpi eq, %[[IV]], %[[C0]] : index
 // CHECK-NEXT:      scf.if %[[EQ_ST]] {
-// CHECK-NEXT:        ktdf.data_transfer from %[[PRV]]#8[0] size [32] to %[[IAB:.+]]{{\[}}%[[C0]]] size [32] : memref<32xindex, "L1">, memref<32xindex, strided<[1], offset: ?>, "IAB">
+// CHECK-NEXT:        ktdf.data_transfer from %[[PRV]]#8[0] size [32] to %[[IAB:.+]]{{\[}}%[[C0]]] size [32] {dataflow_scheduler.throttle = 1 : i64} : memref<32xindex, "L1">, memref<32xindex, strided<[1], offset: ?>, "IAB">
 // CHECK-NEXT:      }
 // CHECK-NEXT:      ktdf.ind_data_transfer
 // CHECK-NEXT:        ind_src = none
@@ -178,7 +178,7 @@ module {
             scf.if %eq0 {
               ktdf.data_transfer
                   from %addr_buf_rc[%c0] size [32]
-                  to   %iab_rc[%c0]      size [32]
+                  to   %iab_rc[%c0]      size [32] {dataflow_scheduler.throttle = 1 : i64}
                   : memref<32xindex, strided<[1], offset: ?>, "DDR">,
                     memref<32xindex, strided<[1], offset: ?>, "IAB">
             }

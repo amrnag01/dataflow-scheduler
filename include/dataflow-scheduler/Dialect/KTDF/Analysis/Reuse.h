@@ -25,6 +25,7 @@
 #ifndef DATAFLOW_SCHEDULER_DIALECT_KTDF_ANALYSIS_REUSE_H_
 #define DATAFLOW_SCHEDULER_DIALECT_KTDF_ANALYSIS_REUSE_H_
 
+#include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
 
 #include <optional>
@@ -32,6 +33,13 @@
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 
 namespace mlir::ktdf::reuse {
+
+/// Find the underlying memref.alloc that defines `dest`. If `dest` is a
+/// direct alloc result, return it. If `dest` is a result of a
+/// ktdf.private op, walk the corresponding private_yield operand back to
+/// the alloc inside the private body. Returns nullptr if no alloc can be
+/// found through the chain.
+auto findUnderlyingAlloc(Value dest) -> memref::AllocOp;
 
 /// A legal hoist candidate for BroadcastPromotion.
 struct Candidate {

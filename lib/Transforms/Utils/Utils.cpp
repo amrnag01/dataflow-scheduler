@@ -22,13 +22,10 @@
 
 #include "dataflow-scheduler/Transforms/Utils/Utils.h"
 
+#include <algorithm>
 #include <cassert>
 
-#include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
-#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
-#include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -162,4 +159,11 @@ void scheduler::eraseDeadAncestorOps(llvm::ArrayRef<mlir::Operation*> roots) {
     erased.insert(op);
     op->erase();
   }
+}
+
+int64_t scheduler::getVectorLanes(mlir::Type elem_type,
+                                  mlir::ktdf_arch::ExecutionUnitOp compute) {
+  return std::max(
+      compute.getFeature<mlir::ktdf_arch::feature::SIMD>().getLanes(elem_type),
+      static_cast<int64_t>(1));
 }

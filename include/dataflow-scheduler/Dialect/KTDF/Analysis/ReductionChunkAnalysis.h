@@ -60,7 +60,10 @@ struct ReductionChunkResult {
   llvm::SmallVector<int64_t> chunk_sizes;
 
   /// Indices (into the generic's iterator-type list) of the reduction dims.
-  llvm::SmallVector<int64_t> reduction_dims;
+  llvm::SmallVector<unsigned> reduction_dims;
+
+  /// Sizes of the reduction dimensions (in iterator space).
+  llvm::SmallVector<int64_t> red_dim_sizes;
 };
 
 /// Analyse a linalg.generic and return chunking parameters so that each chunk

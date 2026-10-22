@@ -44,8 +44,8 @@ void scheduler::buildKTIRFrontendPipeline(
   //   - The scheduler has not made any mapping / scheduling decisions yet.
   //  -> Apply patterns that subtitute front-end constructs that might make
   //     scheduler-illegal programs legal.
-  // pm.addNestedPass<mlir::func::FuncOp>(
-  //     createApplyDevicePatternsPass({"pre_mapping"}));
+  pm.addNestedPass<mlir::func::FuncOp>(
+      createApplyDevicePatternsPass({"pre_mapping"}));
 
   pm.addPass(createKTIRLegalityCheckPass());
   pm.addPass(createComputeGroupExtractionPass());
@@ -58,8 +58,10 @@ void scheduler::buildKTIRFrontendPipeline(
     nested.addPass(mlir::createLinalgMorphOpsPass(
         {.categoryToGeneric = true, .namedToGeneric = true}));
     nested.addPass(createFuseLinalgPass());
+    nested.addPass(createKTIRMapAndTilePass());
+    nested.addPass(createKTIRBufferizePass());
+    nested.addPass(createKTIRPipelinePass());
   }
-  pm.addPass(createConstructThreeStagePipelinePass(scheduler_ctx));
 }
 
 void scheduler::buildSchedulerOptimizationPipeline(
@@ -84,6 +86,9 @@ void scheduler::buildSchedulerOptimizationPipeline(
     nested.addPass(createHoistInvariantsPass());
     nested.addPass(createHoistConstantStoragePass());
   }
+  // Path expansion can only split stages, so it expects transfers between
+  // memories that are relayed through FIFOs in one stage.
+  pm.addPass(createFoldFifoRelayStagesPass());
   pm.addPass(createPathExpansionPass(scheduler_ctx));
   // Path expansion materializes the stages and their units, which is what says
   // whether an indirect address buffer fill is on a memory its unit can read.
@@ -146,6 +151,7 @@ void scheduler::buildSchedulerOptimizationPipeline(
 
 void scheduler::buildDFIRBackendPipeline(
     mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
+  pm.addPass(mlir::ktdf::createLoopIVAffineMulStrengthReductionPass());
   pm.addPass(createKTDFToKTDFLoweringPass(scheduler_ctx));
 
   // Checkpoint 'post_lowering':

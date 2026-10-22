@@ -139,6 +139,21 @@ class TransferInfoFactory {
       bool intermediate_is_source, const PrivateResourceSpec* buffer_spec,
       mlir::OpBuilder& builder);
 
+  /// Create transfer from template that preserves both sides of the template.
+  /// Indices, sizes and maps are copied verbatim and no private resources are
+  /// attached; callers set source/dest private resources afterwards for the
+  /// side(s) they want to retarget (e.g. a FIFO slot whose type changes).
+  /// \p template_op must be a DataTransferOp.
+  /// @param template_op The original transfer operation to adapt
+  /// @param edge The architecture edge this transfer implements
+  /// @param source_resource The source resource
+  /// @param dest_resource The destination resource
+  /// @return Pointer to created transfer info (owned by factory)
+  TransferMaterializationInfo* createFromTemplate(
+      mlir::Operation* template_op,
+      const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,
+      ResourceType source_resource, ResourceType dest_resource);
+
   /// Create transfer for FIFO operation
   /// Used when adapting FIFO read/write operations to work with path expansion
   /// @param fifo_op The FIFO operation (read or write)

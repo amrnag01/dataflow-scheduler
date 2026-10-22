@@ -148,6 +148,17 @@ struct SubsumeLinearizeIndexPass
       }
     }
 
+    // Replace any remaining constant-stride linearize_index ops with
+    // affine.apply.
+    llvm::SmallVector<ktdf::TilingLinearizeIndexOp> remaining;
+    getOperation()->walk([&](ktdf::TilingLinearizeIndexOp op) {
+      if (hasAllConstantStrides(op)) remaining.push_back(op);
+    });
+    for (ktdf::TilingLinearizeIndexOp op : remaining) {
+      auto apply = buildSubscriptApply(rewriter, op, op);
+      rewriter.replaceOp(op, apply.getResult());
+    }
+
     // Erase dead linearize ops.
     llvm::SmallVector<ktdf::TilingLinearizeIndexOp> dead;
     getOperation()->walk([&](ktdf::TilingLinearizeIndexOp op) {

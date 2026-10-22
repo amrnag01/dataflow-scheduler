@@ -27,6 +27,7 @@
 #include <mlir/IR/BuiltinTypes.h>
 #include <mlir/IR/OpDefinition.h>
 #include <mlir/IR/OpImplementation.h>
+#include <mlir/IR/TypeUtilities.h>
 #include <mlir/Interfaces/SideEffectInterfaces.h>
 #include <mlir/Interfaces/ViewLikeInterface.h>
 

@@ -140,7 +140,7 @@ auto scheduler::hoistInvariants(mlir::Operation* source) -> size_t {
               &generic.getBodyRegion());
         },
         [&](mlir::Operation* op, mlir::Region* /*region*/) -> bool {
-          return mlir::isPure(op);
+          return mlir::isPure(op) && !llvm::isa<mlir::linalg::IndexOp>(op);
         },
         [&](mlir::Operation* op, mlir::Region* /*region*/) {
           op->moveBefore(generic);

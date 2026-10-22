@@ -153,6 +153,15 @@ class PathExpansionMaterializer {
   /// Helper to synthesize a new transfer stage (for kSyntheticTransfer)
   void synthesizeTransferStage(const StageMaterializationInfo& info);
 
+  /// Emit the transfers the planner created for an original stage that also
+  /// moves data for a path through its unit. These are the transfers with no
+  /// template op; they go after the stage's own body.
+  void appendPlannedTransfers(const StageMaterializationInfo& info);
+
+  /// Emit one data transfer the planner created between two private
+  /// resources.
+  void emitSyntheticTransfer(const TransferMaterializationInfo& transfer_info);
+
   /// Helper to build stage-to-token mapping from private results
   void buildStageToTokenMapping(
       const llvm::SmallVector<StageNode*>& stages_with_deps,

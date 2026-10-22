@@ -16,6 +16,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFAnalysis
 
   LINK_LIBS PUBLIC
     DataflowScheduler::Analysis
+    DataflowSchedulerDialects::KTDFAnalysis
     DataflowSchedulerDialects::KTDFDialect
     DataflowScheduler::Utils
 

@@ -345,4 +345,57 @@ def ReductionDimChunkingPass : Pass<"reduction-dim-chunking", "mlir::ModuleOp"> 
   ];
 }
 
+def LoopIVAffineMulStrengthReductionPass
+    : Pass<"loop-iv-affine-mul-strength-reduction", "mlir::ModuleOp"> {
+  let summary = "Strength-reduce affine.apply IV multiplications into iter-arg "
+                "additive recurrences";
+  let description = [{
+    Replaces each `affine.apply` whose single-result map is a weighted sum of
+    induction variables of enclosing `scf.for` loops:
+
+      (d0, d1, ..., dn) -> (d0*N0 + d1*N1 + ... + dn*Nn)
+
+    with an additive recurrence threaded as iter-args through those loops,
+    eliminating the multiplications entirely.
+
+    For each qualifying affine.apply the transformation processes the
+    participating loops from outermost to innermost.  Each loop gets one new
+    iter-arg whose value equals the partial sum of all contributions from that
+    loop and all enclosing participating loops evaluated at the current IVs:
+
+      iter_arg_k  ==  sum_{i=0}^{k} (iv_i * Ni)   (at runtime)
+
+    Concretely:
+      - The outermost participating loop gets an iter-arg initialized to
+        `lb_0 * N0` and incremented by `step_0 * N0` each iteration.
+      - Each subsequent participating loop k gets an iter-arg initialized
+        from the previous loop's iter-arg (which carries the outer partial
+        sum) plus `lb_k * Nk`, and incremented by `step_k * Nk`.
+      - Any loop between two consecutive participating loops that does not
+        contribute an IV to the map has the accumulated value threaded
+        through it as a pass-through iter-arg.
+      - The innermost participating loop's iter-arg holds the full sum and
+        replaces all uses of the affine.apply result.
+      - The affine.apply op itself becomes dead and is erased.
+
+    Preconditions (checked per candidate; non-matching ops are skipped):
+      - The affine map has exactly one result that is a sum of terms
+        `di * Ni` where each Ni is a compile-time integer constant.
+      - Every dimension di is the induction variable of a distinct
+        `scf.for` loop that is a proper ancestor of the `affine.apply`.
+      - The participating loops are totally ordered by the ancestor relation
+        (no two are siblings or in unrelated scopes).
+
+    Invariant preserved: at every point the innermost iter-arg equals what
+    the original `affine.apply` would have produced for the current IVs.
+  }];
+  let constructor =
+      "::mlir::ktdf::createLoopIVAffineMulStrengthReductionPass()";
+  let dependentDialects = [
+    "mlir::affine::AffineDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect"
+  ];
+}
+
 #endif // DATAFLOW_SCHEDULER_DIALECT_KTDF_TRANSFORMS_PASSES_TD
