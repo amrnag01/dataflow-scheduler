@@ -490,6 +490,9 @@ static void symbolizeLoopOrdering(
     scf::ForOp innermostLoop = loops[numLoops - 1];
     OpBuilder bodyBuilder(innermostLoop.getBody(), innermostLoop.getBody()->begin());
 
+    SmallVector<Value> selectedIVs(numLoops);
+    llvm::DenseSet<Operation*> selectionTreeOps;
+
     for (unsigned origLoopIdx = 0; origLoopIdx < numLoops; ++origLoopIdx) {
       scf::ForOp lastLoop = loops[numLoops - 1];
       Value selectedIV = lastLoop.getInductionVar();
@@ -499,16 +502,45 @@ static void symbolizeLoopOrdering(
         Value indexConst = arith::ConstantOp::create(
             bodyBuilder, loc, bodyBuilder.getIndexType(),
             bodyBuilder.getIndexAttr(i));
+        selectionTreeOps.insert(indexConst.getDefiningOp());
+
         Value cond = arith::CmpIOp::create(
             bodyBuilder, loc, arith::CmpIPredicate::eq, positions[origLoopIdx],
             indexConst).getResult();
+        selectionTreeOps.insert(cond.getDefiningOp());
+
         selectedIV = arith::SelectOp::create(bodyBuilder, loc, cond, iv,
                                              selectedIV);
+        selectionTreeOps.insert(selectedIV.getDefiningOp());
       }
-
-      // Store selectedIV but don't use it yet
-      (void)selectedIV;
+      selectedIVs[origLoopIdx] = selectedIV;
     }
+
+    // Step 5: Replace uses of original loop IVs with selected IVs
+    // Skip uses in selection tree ops and loop definitions
+    llvm::DenseSet<Operation*> loopDefOps;
+    for (unsigned i = 0; i < numLoops; ++i) {
+      scf::ForOp loop = loops[i];
+      loopDefOps.insert(loop.getOperation());
+    }
+
+    innermostLoop.getBody()->walk([&](Operation* op) {
+      // Skip if this operation is part of selection trees or is a loop definition
+      if (selectionTreeOps.count(op) || loopDefOps.count(op)) return;
+      if (isa<scf::YieldOp>(op)) return;
+
+      // Replace uses of original IVs with selected IVs
+      for (unsigned loopIdx = 0; loopIdx < numLoops; ++loopIdx) {
+        scf::ForOp loop = loops[loopIdx];
+        Value origIV = loop.getInductionVar();
+        Value selectedIV = selectedIVs[loopIdx];
+        for (auto& operand : op->getOpOperands()) {
+          if (operand.get() == origIV) {
+            operand.set(selectedIV);
+          }
+        }
+      }
+    });
   }
 }
 
