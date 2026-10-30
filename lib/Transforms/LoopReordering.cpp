@@ -278,6 +278,33 @@ struct CandidateSetInfo {
       pairOps;  ///< pairOps[i]: between loops[i] and loops[i+1]
 };
 
+/// Returns true if lower bound, upper bound or step of `loop` transitively
+/// depends on the induction variable of any loop in `setLoops`. Such a loop
+/// cannot be reordered with those loops, since its bounds can't be computed
+/// outside of the loop whose IV they use.
+static bool boundsDependOnSetIVs(scf::ForOp loop,
+                                 ArrayRef<scf::ForOp> setLoops) {
+  scf::ForOp outermostLoop = setLoops.front();
+  Operation* outermost = outermostLoop.getOperation();
+  llvm::DenseSet<Value> setIVs;
+  for (scf::ForOp l : setLoops) setIVs.insert(l.getInductionVar());
+
+  SmallVector<Value> worklist = {loop.getLowerBound(), loop.getUpperBound(),
+                                 loop.getStep()};
+  llvm::DenseSet<Operation*> visited;
+  while (!worklist.empty()) {
+    Value val = worklist.pop_back_val();
+    if (setIVs.count(val)) return true;
+    Operation* defOp = val.getDefiningOp();
+    // Block arguments other than set IVs, and values defined outside the
+    // outermost loop of the set, cannot depend on the set's IVs.
+    if (!defOp || !outermost->isProperAncestor(defOp)) continue;
+    if (!visited.insert(defOp).second) continue;
+    worklist.append(defOp->operand_begin(), defOp->operand_end());
+  }
+  return false;
+}
+
 static void findCandidateSets(
     Operation* root, SmallVectorImpl<CandidateSetInfo>& candidateSets) {
   // Step 1: Find starting points (startLoops) for identifying candidate sets.
@@ -311,8 +338,13 @@ static void findCandidateSets(
       // parent loop is either empty, or fully hoistable and/or sinkable. If
       // hoisting or sinking is needed to add the loop to the current set, then
       // need to move these ops also.
+      // The child loop cannot join the set if its bounds depend on the IV of
+      // any loop already in the set (e.g. a tail tile size derived from an
+      // outer tile loop's IV), as it could then not be moved outside of that
+      // loop. Check this before moving any ops.
       SmallVector<InterleavedOpInfo> pairInfo;
-      if (clearAndCheckCandidates(current_loop, child_loop, pairInfo)) {
+      if (!boundsDependOnSetIVs(child_loop, current_set.loops) &&
+          clearAndCheckCandidates(current_loop, child_loop, pairInfo)) {
         current_set.loops.push_back(child_loop);
         current_set.pairOps.push_back(std::move(pairInfo));
         current_loop = child_loop;
@@ -500,19 +532,22 @@ static void symbolizeLoopOrdering(
     SmallVector<Value> selectedIVs(numLoops);
     llvm::DenseSet<Operation*> selectionTreeOps;
 
+    // positions[d] holds the index of the original loop that runs at depth d
+    // (see the upper bound select chains above). The IV of original loop j is
+    // therefore the IV of the depth d for which positions[d] == j.
     for (unsigned origLoopIdx = 0; origLoopIdx < numLoops; ++origLoopIdx) {
       scf::ForOp lastLoop = loops[numLoops - 1];
       Value selectedIV = lastLoop.getInductionVar();
+      Value indexConst = arith::ConstantOp::create(
+          bodyBuilder, loc, bodyBuilder.getIndexType(),
+          bodyBuilder.getIndexAttr(origLoopIdx));
+      selectionTreeOps.insert(indexConst.getDefiningOp());
       for (int i = static_cast<int>(numLoops) - 2; i >= 0; --i) {
         scf::ForOp iLoop = loops[i];
         Value iv = iLoop.getInductionVar();
-        Value indexConst = arith::ConstantOp::create(
-            bodyBuilder, loc, bodyBuilder.getIndexType(),
-            bodyBuilder.getIndexAttr(i));
-        selectionTreeOps.insert(indexConst.getDefiningOp());
 
         Value cond = arith::CmpIOp::create(
-            bodyBuilder, loc, arith::CmpIPredicate::eq, positions[origLoopIdx],
+            bodyBuilder, loc, arith::CmpIPredicate::eq, positions[i],
             indexConst).getResult();
         selectionTreeOps.insert(cond.getDefiningOp());
 
@@ -567,6 +602,12 @@ struct LoopReorderingAndTilingPass
     // create false barriers, they are hoisted/sunk to allow reordering
     SmallVector<CandidateSetInfo> candidateSets;
     findCandidateSets(module, candidateSets);
+
+#ifdef DEBUG_LOOP_TILING
+    llvm::outs() << "[LoopReorderingAndTiling] IR after findCandidateSets():\n";
+    module->print(llvm::outs());
+    llvm::outs() << "\n";
+#endif
 
 #ifdef DEBUG_LOOP_TILING
     if (candidateSets.empty()) {
