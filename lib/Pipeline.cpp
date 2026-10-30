@@ -117,7 +117,7 @@ void scheduler::buildSchedulerOptimizationPipeline(
     nested.addPass(createHoistInvariantsPass());
     nested.addPass(createHoistConstantStoragePass());
   }
-  pm.addPass(mlir::ktdf::createBroadcastPromotionPass());
+  // pm.addPass(mlir::ktdf::createBroadcastPromotionPass());
   pm.addPass(createDoubleBufferingPass(scheduler_ctx));
   // Parallelizing before tile selection is beneficial because the tile size
   // selection pass would now take parallel instances into account while
