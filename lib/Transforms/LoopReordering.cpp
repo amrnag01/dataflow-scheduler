@@ -24,13 +24,18 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <algorithm>
+
+#include "dataflow-scheduler/Dialect/KTDF/Analysis/PipelineScope.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Transforms/Utils/Hoisting.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/raw_ostream.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
@@ -439,8 +444,19 @@ struct LoopInfo {
       : lowerBound(lb), upperBound(ub), step(s), inductionVar(iv) {}
 };
 
-static void symbolizeLoopOrdering(
+/// Metadata describing how a candidate set was symbolized.
+struct SymbolizedSetInfo {
+  SmallVector<scf::ForOp> loops;  ///< Physical loops, outermost first.
+  /// positions[d]: index of the original loop that runs at depth d.
+  SmallVector<Value> positions;
+  /// selectedIVs[j]: value standing for the IV of original loop j.
+  SmallVector<Value> selectedIVs;
+};
+
+static SmallVector<SymbolizedSetInfo> symbolizeLoopOrdering(
     ArrayRef<CandidateSetInfo> candidateSets) {
+  SmallVector<SymbolizedSetInfo> symbolizedSets;
+
   // Map from candidate set to its position variables
   llvm::DenseMap<const CandidateSetInfo*, SmallVector<Value>>
       candidateSetPositions;
@@ -570,6 +586,9 @@ static void symbolizeLoopOrdering(
       // Skip if this operation is part of selection trees or is a loop definition
       if (selectionTreeOps.count(op) || loopDefOps.count(op)) return;
       if (isa<scf::YieldOp>(op)) return;
+      // The operands of buffer_phase are the loops of the pipeline scope in
+      // physical nesting order, so they must stay the raw loop IVs.
+      if (isa<mlir::ktdf::BufferPhaseOp>(op)) return;
 
       // Replace uses of original IVs with selected IVs
       for (unsigned loopIdx = 0; loopIdx < numLoops; ++loopIdx) {
@@ -583,7 +602,294 @@ static void symbolizeLoopOrdering(
         }
       }
     });
+
+    symbolizedSets.push_back(
+        {SmallVector<scf::ForOp>(loops.begin(), loops.end()), positions,
+         selectedIVs});
   }
+  return symbolizedSets;
+}
+
+// ---------------------------------------------------------------------------
+
+constexpr StringLiteral kLoadUnit = "L3LU";
+constexpr StringLiteral kStoreUnit = "L3SU";
+
+/// Collects what the data in `transfer` depends on, by following the operands
+/// of the transfer back to the loop induction variables they are computed from.
+///   - `staticLoops`: loops whose raw IV is reached.
+///   - `setDeps`: (set index, original loop index) pairs, reached through the
+///     selected IVs of a symbolized candidate set.
+/// Values coming from ktdf.select_memref are not followed, since they select
+/// the double buffer, which is accounted for separately. Returns false if the
+/// dependences cannot be determined.
+static bool collectTransferDeps(
+    mlir::ktdf::DataTransferOp transfer, ArrayRef<scf::ForOp> chain,
+    const llvm::DenseMap<Value, std::pair<unsigned, unsigned>>& selectedIVMap,
+    llvm::DenseSet<Operation*>& staticLoops,
+    llvm::DenseSet<std::pair<unsigned, unsigned>>& setDeps) {
+  scf::ForOp outermostLoop = chain.front();
+  Operation* outermost = outermostLoop.getOperation();
+  llvm::DenseSet<Operation*> chainOps;
+  for (scf::ForOp loop : chain) chainOps.insert(loop.getOperation());
+
+  SmallVector<Value> worklist(transfer->operand_begin(),
+                              transfer->operand_end());
+  llvm::DenseSet<Operation*> visited;
+  while (!worklist.empty()) {
+    Value val = worklist.pop_back_val();
+
+    auto selected = selectedIVMap.find(val);
+    if (selected != selectedIVMap.end()) {
+      setDeps.insert(selected->second);
+      continue;
+    }
+
+    if (auto arg = dyn_cast<BlockArgument>(val)) {
+      Operation* owner = arg.getOwner()->getParentOp();
+      if (auto forOp = dyn_cast<scf::ForOp>(owner);
+          forOp && chainOps.count(owner)) {
+        if (forOp.getInductionVar() != val) return false;  // iter_arg
+        staticLoops.insert(owner);
+        continue;
+      }
+      // Arguments of other regions inside the loop nest are not understood.
+      if (outermost->isProperAncestor(owner)) return false;
+      continue;
+    }
+
+    Operation* defOp = val.getDefiningOp();
+    if (isa<mlir::ktdf::SelectMemrefOp>(defOp)) continue;
+    // Defined outside of the loop nest, so independent of every loop.
+    if (!outermost->isProperAncestor(defOp)) continue;
+    if (defOp->getNumRegions() != 0) return false;
+    if (!visited.insert(defOp).second) continue;
+    worklist.append(defOp->operand_begin(), defOp->operand_end());
+  }
+  return true;
+}
+
+/// Wraps `transfer` in an scf.if so that it only runs when it is not redundant
+/// for the current loop ordering. See conditionalizeDataTransfers().
+static bool conditionalizeTransfer(
+    mlir::ktdf::DataTransferOp transfer,
+    ArrayRef<SymbolizedSetInfo> symbolizedSets,
+    const llvm::DenseMap<Value, std::pair<unsigned, unsigned>>& selectedIVMap,
+    const llvm::DenseMap<Operation*, std::pair<unsigned, unsigned>>&
+        loopSetInfo) {
+  // Only transfers in the L3 load/store unit stages are handled.
+  auto stage = transfer->getParentOfType<mlir::ktdf::StageOp>();
+  if (!stage) return false;
+  auto units = stage.getApplicableUnits();
+  if (!units || units->size() != 1) return false;
+  auto unitName = dyn_cast<StringAttr>(units->getValue().front());
+  if (!unitName) return false;
+  bool isLoad = unitName.getValue() == kLoadUnit;
+  if (!isLoad && unitName.getValue() != kStoreUnit) return false;
+  auto pipeline = dyn_cast<mlir::ktdf::PipelineOp>(stage->getParentOp());
+  if (!pipeline) return false;
+
+  // Step 1: Find the loops the transfer is inside of (outermost first). Other
+  // kinds of loops are not understood.
+  SmallVector<scf::ForOp> chain;
+  for (Operation* p = transfer->getParentOp(); p; p = p->getParentOp()) {
+    if (auto forOp = dyn_cast<scf::ForOp>(p))
+      chain.push_back(forOp);
+    else if (isa<LoopLikeOpInterface>(p))
+      return false;
+  }
+  if (chain.empty()) return false;
+  std::reverse(chain.begin(), chain.end());
+  for (scf::ForOp loop : chain)
+    if (!matchPattern(loop.getLowerBound(), m_Zero()) ||
+        !matchPattern(loop.getStep(), m_One()))
+      return false;
+  unsigned n = chain.size();
+
+  // Step 2: Find which loops the transfer depends on.
+  llvm::DenseSet<Operation*> staticLoops;
+  llvm::DenseSet<std::pair<unsigned, unsigned>> setDeps;
+  if (!collectTransferDeps(transfer, chain, selectedIVMap, staticLoops,
+                           setDeps))
+    return false;
+
+  // A transfer that depends on every enclosing loop is never redundant, for
+  // any loop ordering, so there is nothing to guard.
+  bool dependsOnAllLoops = true;
+  for (scf::ForOp loop : chain) {
+    if (staticLoops.count(loop.getOperation())) continue;
+    auto setInfo = loopSetInfo.find(loop.getOperation());
+    if (setInfo == loopSetInfo.end()) {
+      dependsOnAllLoops = false;
+      break;
+    }
+    unsigned setIdx = setInfo->second.first;
+    for (unsigned j = 0; j < symbolizedSets[setIdx].loops.size(); ++j)
+      if (!setDeps.count({setIdx, j})) dependsOnAllLoops = false;
+    if (!dependsOnAllLoops) break;
+  }
+  if (dependsOnAllLoops) return false;
+
+  // Loops enclosing the pipeline whose IVs select the double buffer.
+  llvm::DenseSet<Operation*> scopeLoops;
+  for (scf::ForOp loop : mlir::ktdf::getPipelineEnclosingScope(pipeline).loops)
+    scopeLoops.insert(loop.getOperation());
+  uint64_t numPhases = pipeline.getModulo().value_or(1);
+
+  OpBuilder b(transfer);
+  Location loc = transfer.getLoc();
+  auto idx = [&](int64_t v) -> Value {
+    return arith::ConstantOp::create(b, loc, b.getIndexType(),
+                                     b.getIndexAttr(v));
+  };
+  auto boolConst = [&](bool v) -> Value {
+    return arith::ConstantOp::create(b, loc, b.getI1Type(), b.getBoolAttr(v));
+  };
+  auto andI = [&](Value x, Value y) -> Value {
+    return b.createOrFold<arith::AndIOp>(loc, x, y);
+  };
+  auto orI = [&](Value x, Value y) -> Value {
+    return b.createOrFold<arith::OrIOp>(loc, x, y);
+  };
+  auto cmp = [&](arith::CmpIPredicate pred, Value x, Value y) -> Value {
+    return b.createOrFold<arith::CmpIOp>(loc, pred, x, y);
+  };
+  Value trueV = boolConst(true);
+  Value falseV = boolConst(false);
+
+  // Step 3: For each physical loop, build a condition that is true if the
+  // transfer depends on that loop. For loops in a symbolized set, this is true
+  // if the transfer depends on the original loop placed at that depth.
+  SmallVector<Value> dep(n, falseV);
+  for (unsigned i = 0; i < n; ++i) {
+    Operation* loopOp = chain[i].getOperation();
+    if (staticLoops.count(loopOp)) {
+      dep[i] = trueV;
+      continue;
+    }
+    auto setInfo = loopSetInfo.find(loopOp);
+    if (setInfo == loopSetInfo.end()) continue;
+    auto [setIdx, depth] = setInfo->second;
+    for (auto [depSetIdx, origLoop] : setDeps)
+      if (depSetIdx == setIdx)
+        dep[i] = orI(dep[i], cmp(arith::CmpIPredicate::eq,
+                                 symbolizedSets[setIdx].positions[depth],
+                                 idx(origLoop)));
+  }
+
+  // Step 4: A loop that the transfer does not depend on only needs to repeat
+  // the transfer if the transfer depends on a loop nested inside of it, since
+  // that inner loop then changes what is transferred in every iteration.
+  // suffixDep[i] is true if the transfer depends on loop i or any inner loop.
+  // Loops inside the stage are swept completely by every execution of the
+  // stage, and the buffer holds the whole sweep, so a dependence on a loop
+  // inside the stage does not force the loops outside of it to repeat the
+  // transfer. For these loops suffixDep[i] is just whether the transfer depends
+  // on loop i itself. Loops outside of the pipeline's scope are not understood,
+  // so they always repeat it.
+  SmallVector<Value> suffixDep(n);
+  Value accScope = falseV;
+  for (int i = static_cast<int>(n) - 1; i >= 0; --i) {
+    Operation* loopOp = chain[i].getOperation();
+    if (stage->isProperAncestor(loopOp)) {
+      suffixDep[i] = dep[i];
+    } else if (scopeLoops.count(loopOp)) {
+      accScope = orI(accScope, dep[i]);
+      suffixDep[i] = accScope;
+    } else {
+      suffixDep[i] = trueV;
+    }
+  }
+
+  // Step 5: Build the condition under which the transfer must run. Loops with
+  // suffixDep false are the ones the transfer is redundant across.
+  //   - Loads: only the first iteration of those loops is needed. If the
+  //     pipeline is double buffered, the first `numPhases` iterations of the
+  //     loops that select the buffer are needed, so that every buffer is
+  //     filled. These iterations are counted over the flattened iteration
+  //     space of those loops.
+  //   - Stores: only the last iteration of those loops is needed, since it
+  //     holds the final value.
+  Value cond = trueV;
+  if (isLoad) {
+    Value zero = idx(0);
+    Value flatIdx = zero;
+    Value flatSize = idx(1);
+    for (int i = static_cast<int>(n) - 1; i >= 0; --i) {
+      Value iv = chain[i].getInductionVar();
+      if (numPhases <= 1 || !scopeLoops.count(chain[i].getOperation())) {
+        cond = andI(cond, orI(suffixDep[i], cmp(arith::CmpIPredicate::eq, iv,
+                                                zero)));
+        continue;
+      }
+      Value inFlat = b.createOrFold<arith::XOrIOp>(loc, suffixDep[i], trueV);
+      Value newIdx = b.createOrFold<arith::AddIOp>(
+          loc, flatIdx, b.createOrFold<arith::MulIOp>(loc, iv, flatSize));
+      Value newSize = b.createOrFold<arith::MulIOp>(
+          loc, flatSize, chain[i].getUpperBound());
+      flatIdx = b.createOrFold<arith::SelectOp>(loc, inFlat, newIdx, flatIdx);
+      flatSize =
+          b.createOrFold<arith::SelectOp>(loc, inFlat, newSize, flatSize);
+    }
+    if (numPhases > 1)
+      cond = andI(cond, cmp(arith::CmpIPredicate::ult, flatIdx,
+                            idx(static_cast<int64_t>(numPhases))));
+  } else {
+    Value one = idx(1);
+    for (int i = static_cast<int>(n) - 1; i >= 0; --i) {
+      Value last = b.createOrFold<arith::SubIOp>(
+          loc, chain[i].getUpperBound(), one);
+      cond = andI(cond,
+                  orI(suffixDep[i], cmp(arith::CmpIPredicate::eq,
+                                        chain[i].getInductionVar(), last)));
+    }
+  }
+
+  // Step 6: Guard the transfer with the condition, unless it always holds.
+  if (matchPattern(cond, m_One())) return false;
+  auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, cond,
+                                /*withElseRegion=*/false);
+  transfer->moveBefore(ifOp.thenBlock()->getTerminator());
+  return true;
+}
+
+/// Makes the data transfers in the L3 load/store unit stages conditional on
+/// the loop ordering, to avoid redundant transfers. A transfer that does not
+/// depend on a loop only needs to run in the first iteration of that loop
+/// (last iteration for stores), provided no loop that the transfer depends on
+/// is nested inside of it. Since the loop ordering inside a candidate set is
+/// still symbolic, these conditions are written in terms of the position
+/// variables of the set.
+static void conditionalizeDataTransfers(
+    ArrayRef<SymbolizedSetInfo> symbolizedSets, Operation* root) {
+  llvm::DenseMap<Value, std::pair<unsigned, unsigned>> selectedIVMap;
+  llvm::DenseMap<Operation*, std::pair<unsigned, unsigned>> loopSetInfo;
+  for (unsigned s = 0; s < symbolizedSets.size(); ++s) {
+    const SymbolizedSetInfo& set = symbolizedSets[s];
+    for (unsigned j = 0; j < set.selectedIVs.size(); ++j)
+      selectedIVMap[set.selectedIVs[j]] = {s, j};
+    for (unsigned d = 0; d < set.loops.size(); ++d) {
+      scf::ForOp loop = set.loops[d];
+      loopSetInfo[loop.getOperation()] = {s, d};
+    }
+  }
+
+  SmallVector<mlir::ktdf::DataTransferOp> transfers;
+  root->walk(
+      [&](mlir::ktdf::DataTransferOp transfer) { transfers.push_back(transfer); });
+
+  unsigned numConditionalized = 0;
+  for (mlir::ktdf::DataTransferOp transfer : transfers)
+    if (conditionalizeTransfer(transfer, symbolizedSets, selectedIVMap,
+                               loopSetInfo))
+      ++numConditionalized;
+
+#ifdef DEBUG_LOOP_TILING
+  llvm::outs() << "[LoopReorderingAndTiling] Made " << numConditionalized
+               << " of " << transfers.size()
+               << " data transfer(s) conditional.\n";
+#endif
+  (void)numConditionalized;
 }
 
 // ---------------------------------------------------------------------------
@@ -626,7 +932,12 @@ struct LoopReorderingAndTilingPass
 #endif
 
     // Step 2: Symbolize loop ordering for each candidate set
-    symbolizeLoopOrdering(candidateSets);
+    SmallVector<SymbolizedSetInfo> symbolizedSets =
+        symbolizeLoopOrdering(candidateSets);
+
+    // Step 3: Make data transfers conditional on the loop ordering, to avoid
+    // redundant transfers
+    conditionalizeDataTransfers(symbolizedSets, module);
 
     // Step 3(temp): Test reorderLoops by reversing every candidate set.
     /*for (auto& info : candidateSets) {
