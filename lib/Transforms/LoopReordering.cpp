@@ -888,8 +888,80 @@ static void conditionalizeDataTransfers(
   llvm::outs() << "[LoopReorderingAndTiling] Made " << numConditionalized
                << " of " << transfers.size()
                << " data transfer(s) conditional.\n";
+  llvm::outs().flush();
 #endif
   (void)numConditionalized;
+}
+
+// ---------------------------------------------------------------------------
+
+/// Applies values to symbols in the IR. Each key of `symbolValues` must be the
+/// result of a ktdf.tiling.reserve_size op (a tile size or a loop position
+/// created by this pass). It is replaced with an index constant holding the
+/// given value, and the reserve_size op is erased. Fails, leaving the IR
+/// unchanged, if a key is not such a result or its value violates the
+/// min_value or divisibility of the symbol.
+static LogicalResult resolveSymbols(
+    const llvm::DenseMap<Value, int64_t>& symbolValues) {
+  // Step 1: Check every symbol before changing anything.
+  SmallVector<std::pair<mlir::ktdf::TilingReserveSizeOp, int64_t>> resolved;
+  for (auto [symbol, value] : symbolValues) {
+    auto reserveOp = symbol.getDefiningOp<mlir::ktdf::TilingReserveSizeOp>();
+    if (!reserveOp) {
+      mlir::emitError(symbol.getLoc())
+          << "resolveSymbols: value is not the result of a "
+             "ktdf.tiling.reserve_size";
+      return failure();
+    }
+    int64_t minValue = reserveOp.getMinValue().getSExtValue();
+    int64_t divisibility = reserveOp.getDivisibility().getSExtValue();
+    if (value < minValue) {
+      reserveOp.emitError() << "resolveSymbols: value " << value
+                            << " is below the symbol's min_value " << minValue;
+      return failure();
+    }
+    if (divisibility > 1 && value % divisibility != 0) {
+      reserveOp.emitError()
+          << "resolveSymbols: value " << value
+          << " is not divisible by the symbol's divisibility " << divisibility;
+      return failure();
+    }
+    resolved.push_back({reserveOp, value});
+  }
+
+  // Step 2: Replace each symbol with a constant.
+  for (auto [reserveOp, value] : resolved) {
+    OpBuilder builder(reserveOp);
+    Value constant =
+        arith::ConstantIndexOp::create(builder, reserveOp.getLoc(), value);
+    reserveOp.getResult().replaceAllUsesWith(constant);
+    reserveOp.erase();
+  }
+
+#ifdef DEBUG_LOOP_TILING
+  llvm::outs() << "[LoopReorderingAndTiling] Resolved " << resolved.size()
+               << " symbol(s).\n";
+  llvm::outs().flush();
+#endif
+  return success();
+}
+
+// ---------------------------------------------------------------------------
+
+/// Test input for resolveSymbols(). Every tile size is 2, and every candidate
+/// set keeps its original loop order, i.e. positions[d] = d.
+static llvm::DenseMap<Value, int64_t> makeTestSymbolValues(
+    ArrayRef<SymbolizedSetInfo> symbolizedSets, Operation* root) {
+  llvm::DenseMap<Value, int64_t> symbolValues;
+  for (const SymbolizedSetInfo& set : symbolizedSets)
+    for (auto [depth, position] : llvm::enumerate(set.positions))
+      symbolValues[position] = static_cast<int64_t>(depth);
+
+  // Everything else is a tile size.
+  root->walk([&](mlir::ktdf::TilingReserveSizeOp reserveOp) {
+    symbolValues.try_emplace(reserveOp.getResult(), 2);
+  });
+  return symbolValues;
 }
 
 // ---------------------------------------------------------------------------
@@ -913,6 +985,7 @@ struct LoopReorderingAndTilingPass
     llvm::outs() << "[LoopReorderingAndTiling] IR after findCandidateSets():\n";
     module->print(llvm::outs());
     llvm::outs() << "\n";
+    llvm::outs().flush();
 #endif
 
 #ifdef DEBUG_LOOP_TILING
@@ -920,6 +993,7 @@ struct LoopReorderingAndTilingPass
       llvm::outs()
           << "[LoopReorderingAndTiling] No interchange-candidate loop sets "
              "found.\n";
+      llvm::outs().flush();
       return;
     }
 
@@ -929,6 +1003,7 @@ struct LoopReorderingAndTilingPass
       printCandidateSet(static_cast<unsigned>(idx), info.loops, info.pairOps,
                         llvm::outs());
     llvm::outs() << "\n";
+    llvm::outs().flush();
 #endif
 
     // Step 2: Symbolize loop ordering for each candidate set
@@ -938,6 +1013,20 @@ struct LoopReorderingAndTilingPass
     // Step 3: Make data transfers conditional on the loop ordering, to avoid
     // redundant transfers
     conditionalizeDataTransfers(symbolizedSets, module);
+
+#ifdef DEBUG_LOOP_TILING
+    llvm::outs() << "[LoopReorderingAndTiling] Symbolic IR before "
+                    "resolveSymbols():\n";
+    module->print(llvm::outs());
+    llvm::outs() << "\n";
+    llvm::outs().flush();
+#endif
+
+    // Step 4: Apply values to the symbols. The values are not chosen yet, so
+    // a fixed test input is used for now.
+    llvm::DenseMap<Value, int64_t> symbolValues =
+        makeTestSymbolValues(symbolizedSets, module);
+    if (failed(resolveSymbols(symbolValues))) return signalPassFailure();
 
     // Step 3(temp): Test reorderLoops by reversing every candidate set.
     /*for (auto& info : candidateSets) {
