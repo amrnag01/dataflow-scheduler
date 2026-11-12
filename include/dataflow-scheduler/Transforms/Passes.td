@@ -742,27 +742,42 @@ def IndirectAccessLoopMaterializationPass
   ];
 }
 
-def LoopReorderingAndTilingPass : Pass<"loop-reordering-and-tiling", "mlir::ModuleOp"> {
-  let summary = "Jointly optimize loop reordering and tile size selection";
+def SymbolizeLoopOrderAndDataTransferPass : Pass<"symbolize-loop-order-and-data-transfer", "mlir::ModuleOp"> {
+  let summary = "Make loop order and data transfers symbolic";
   let description = [{
-    Combines loop reordering and tile size selection into a single optimization pass.
+    Prepares the IR for joint optimization of loop reordering and tile size
+    selection, which is done by optimize-loop-order-and-tiling.
 
     1. Identifies groups of scf.for loops that can be freely reordered with respect
        to each other, by classifying the ops that appear between adjacent loop
        headers as hoistable, sinkable, or true barriers. Adjacent loops with no
        true barrier between them are candidates for interchange.
 
-    2. Jointly selects tile sizes for the reordered loops based on:
-       - Loop bounds and hardware constraints
-       - Memory capacity limitations
-       - Data dependency patterns
+    2. Makes the loop order of each candidate set symbolic, using
+       ktdf.tiling.reserve_size placeholders for the position of each loop.
 
-    This combined approach allows for more sophisticated optimization strategies
-    that consider both loop ordering and tile sizing together.
+    3. Makes the data transfers conditional on the (symbolic) loop order, so
+       that redundant transfers are skipped for any order that is chosen.
   }];
-  let constructor = "::scheduler::createLoopReorderingAndTilingPass()";
+  let constructor = "::scheduler::createSymbolizeLoopOrderAndDataTransferPass()";
   let dependentDialects = [
     "mlir::scf::SCFDialect"
+  ];
+}
+
+def OptimizeLoopOrderAndTilingPass : Pass<"optimize-loop-order-and-tiling", "mlir::ModuleOp"> {
+  let summary = "Jointly optimize loop reordering and tile size selection";
+  let description = [{
+    Selects values for the symbols left in the IR by
+    symbolize-loop-order-and-data-transfer, i.e. the loop order of each
+    candidate set and the tile sizes, and applies them to the IR. The values
+    are currently a fixed test input: every candidate set keeps its original
+    order and every tile size is 2.
+  }];
+  let constructor = "::scheduler::createOptimizeLoopOrderAndTilingPass()";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::ktdf::KTDFDialect"
   ];
 }
 

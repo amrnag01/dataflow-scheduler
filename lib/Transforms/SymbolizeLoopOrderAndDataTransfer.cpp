@@ -16,11 +16,12 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Pass: -loop-reordering
+// Pass: -symbolize-loop-order-and-data-transfer
 //
 // Identifies groups of scf.for loops that are candidates for interchange,
 // clears the interleaved ops between them (hoisting or sinking as appropriate),
-// and returns the resulting perfectly-nested candidate sets.
+// makes the loop order of each resulting perfectly-nested candidate set
+// symbolic, and makes the data transfers conditional on that loop order.
 //
 //===----------------------------------------------------------------------===//
 
@@ -29,6 +30,8 @@
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/PipelineScope.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Transforms/Utils/Hoisting.h"
+#include "dataflow-scheduler/Transforms/Utils/LoopOrderSymbols.h"
+#include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/raw_ostream.h"
@@ -40,13 +43,13 @@
 #include "mlir/Pass/Pass.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 
-#define PASS_NAME "loop-reordering-and-tiling"
+#define PASS_NAME "symbolize-loop-order-and-data-transfer"
 #define DEBUG_LOOP_TILING
 
 using namespace mlir;
 
 namespace scheduler {
-#define GEN_PASS_DEF_LOOPREORDERINGANDTILINGPASS
+#define GEN_PASS_DEF_SYMBOLIZELOOPORDERANDDATATRANSFERPASS
 #include "dataflow-scheduler/Transforms/Passes.h.inc"
 }  // namespace scheduler
 
@@ -368,81 +371,7 @@ static void findCandidateSets(
   }
 }
 
-static void interchangeLoops(scf::ForOp forOpA, scf::ForOp forOpB) {
-  assert(&*forOpA.getBody()->begin() == forOpB.getOperation());
-  auto& forOpABody = forOpA.getBody()->getOperations();
-  auto& forOpBBody = forOpB.getBody()->getOperations();
-
-  // Step 1: Splice forOpB out of forOpA's body to just before forOpA in the
-  // parent block. Now, forOpA's body now contains only its terminator.
-  forOpA->getBlock()->getOperations().splice(Block::iterator(forOpA),
-                                             forOpABody, forOpABody.begin(),
-                                             std::prev(forOpABody.end()));
-
-  // Step 2: Splice the original forOpB body contents into the beginning of
-  // forOpA's empty body. Now, forOpA's body contains the forOpB's original body
-  forOpABody.splice(forOpABody.begin(), forOpBBody, forOpBBody.begin(),
-                    std::prev(forOpBBody.end()));
-
-  // Step 3: Splice forOpA into the beginning of forOpB's body so forOpB wraps
-  // forOpA. Now, forOpB's body contains forOpA + forOpB's original body
-  // (interchange complete)
-  forOpBBody.splice(forOpBBody.begin(), forOpA->getBlock()->getOperations(),
-                    Block::iterator(forOpA));
-}
-
-[[maybe_unused]] static void reorderLoops(ArrayRef<scf::ForOp> loops,
-                                          ArrayRef<unsigned> permutation) {
-  assert(loops.size() == permutation.size());
-
-  // The helper interchangeLoops() can interchange pairs of scf.for loops,
-  // similar to mlir::affine::interchangeLoops. To arrange the given loops in
-  // the specified permutation order, need to bubble sort loops into their
-  // intended position through pairwise exchanges.
-  SmallVector<scf::ForOp> current_loops(loops.begin(), loops.end());
-  SmallVector<unsigned> pos(loops.size());
-  for (unsigned i = 0; i < loops.size(); ++i) pos[i] = i;
-
-  // For each target position i (outermost first), bubble the desired loop
-  // down from its current position using adjacent interchanges.
-  for (unsigned i = 0; i < permutation.size(); ++i) {
-    unsigned orig_pos_of_wanted_loop =
-        permutation[i];  // original index we want at position i
-    unsigned curr_pos_of_wanted_loop =
-        pos[orig_pos_of_wanted_loop];  // where it currently sits
-
-    // Bubble it up (swap with predecessor) until it reaches position wanted.
-    while (curr_pos_of_wanted_loop > i) {
-      interchangeLoops(current_loops[curr_pos_of_wanted_loop - 1],
-                       current_loops[curr_pos_of_wanted_loop]);
-      // Update tracking.
-      unsigned orig_above = 0;
-      for (unsigned j = 0; j < loops.size(); ++j)
-        if (pos[j] == curr_pos_of_wanted_loop - 1) {
-          orig_above = j;
-          break;
-        }
-      std::swap(current_loops[curr_pos_of_wanted_loop - 1],
-                current_loops[curr_pos_of_wanted_loop]);
-      pos[orig_above] = curr_pos_of_wanted_loop;
-      pos[orig_pos_of_wanted_loop] = curr_pos_of_wanted_loop - 1;
-      --curr_pos_of_wanted_loop;
-    }
-  }
-}
-
 // ---------------------------------------------------------------------------
-
-struct LoopInfo {
-  Value lowerBound;
-  Value upperBound;
-  Value step;
-  Value inductionVar;
-
-  LoopInfo() = default;
-  LoopInfo(Value lb, Value ub, Value s, Value iv)
-      : lowerBound(lb), upperBound(ub), step(s), inductionVar(iv) {}
-};
 
 /// Metadata describing how a candidate set was symbolized.
 struct SymbolizedSetInfo {
@@ -507,6 +436,8 @@ static SmallVector<SymbolizedSetInfo> symbolizeLoopOrdering(
       auto posOp = mlir::ktdf::TilingReserveSizeOp::create(
           builder, loc, builder.getIndexType(),
           builder.getIndexAttr(0), builder.getIndexAttr(1));
+      // Tag the symbol so that later passes can recognize it.
+      posOp->setAttr(scheduler::kLoopOrderDepthAttr, builder.getIndexAttr(i));
       positions.push_back(posOp.getResult());
     }
 
@@ -612,9 +543,6 @@ static SmallVector<SymbolizedSetInfo> symbolizeLoopOrdering(
 
 // ---------------------------------------------------------------------------
 
-constexpr StringLiteral kLoadUnit = "L3LU";
-constexpr StringLiteral kStoreUnit = "L3SU";
-
 /// Collects what the data in `transfer` depends on, by following the operands
 /// of the transfer back to the loop induction variables they are computed from.
 ///   - `staticLoops`: loops whose raw IV is reached.
@@ -677,15 +605,28 @@ static bool conditionalizeTransfer(
     const llvm::DenseMap<Value, std::pair<unsigned, unsigned>>& selectedIVMap,
     const llvm::DenseMap<Operation*, std::pair<unsigned, unsigned>>&
         loopSetInfo) {
-  // Only transfers in the L3 load/store unit stages are handled.
+  // Only transfers between global and ct_local memory are handled: loads
+  // (global -> ct_local) and stores (ct_local -> global).
+  auto getMemorySpaceKind =
+      [](Value v) -> std::optional<mlir::ktdp::MemorySpaceKind> {
+    auto memrefType = dyn_cast<MemRefType>(v.getType());
+    if (!memrefType) return std::nullopt;
+    auto space =
+        dyn_cast_or_null<mlir::ktdp::MemorySpaceAttr>(memrefType.getMemorySpace());
+    if (!space) return std::nullopt;
+    return space.getKind();
+  };
+  auto srcKind = getMemorySpaceKind(transfer.getSource());
+  auto dstKind = getMemorySpaceKind(transfer.getDestination());
+  if (!srcKind || !dstKind) return false;
+  bool isLoad = *srcKind == mlir::ktdp::MemorySpaceKind::global &&
+                *dstKind == mlir::ktdp::MemorySpaceKind::ct_local;
+  bool isStore = *srcKind == mlir::ktdp::MemorySpaceKind::ct_local &&
+                 *dstKind == mlir::ktdp::MemorySpaceKind::global;
+  if (!isLoad && !isStore) return false;
+
   auto stage = transfer->getParentOfType<mlir::ktdf::StageOp>();
   if (!stage) return false;
-  auto units = stage.getApplicableUnits();
-  if (!units || units->size() != 1) return false;
-  auto unitName = dyn_cast<StringAttr>(units->getValue().front());
-  if (!unitName) return false;
-  bool isLoad = unitName.getValue() == kLoadUnit;
-  if (!isLoad && unitName.getValue() != kStoreUnit) return false;
   auto pipeline = dyn_cast<mlir::ktdf::PipelineOp>(stage->getParentOp());
   if (!pipeline) return false;
 
@@ -885,8 +826,8 @@ static void conditionalizeDataTransfers(
       ++numConditionalized;
 
 #ifdef DEBUG_LOOP_TILING
-  llvm::outs() << "[LoopReorderingAndTiling] Made " << numConditionalized
-               << " of " << transfers.size()
+  llvm::outs() << "[SymbolizeLoopOrderAndDataTransfer] Made "
+               << numConditionalized << " of " << transfers.size()
                << " data transfer(s) conditional.\n";
   llvm::outs().flush();
 #endif
@@ -895,82 +836,12 @@ static void conditionalizeDataTransfers(
 
 // ---------------------------------------------------------------------------
 
-/// Applies values to symbols in the IR. Each key of `symbolValues` must be the
-/// result of a ktdf.tiling.reserve_size op (a tile size or a loop position
-/// created by this pass). It is replaced with an index constant holding the
-/// given value, and the reserve_size op is erased. Fails, leaving the IR
-/// unchanged, if a key is not such a result or its value violates the
-/// min_value or divisibility of the symbol.
-static LogicalResult resolveSymbols(
-    const llvm::DenseMap<Value, int64_t>& symbolValues) {
-  // Step 1: Check every symbol before changing anything.
-  SmallVector<std::pair<mlir::ktdf::TilingReserveSizeOp, int64_t>> resolved;
-  for (auto [symbol, value] : symbolValues) {
-    auto reserveOp = symbol.getDefiningOp<mlir::ktdf::TilingReserveSizeOp>();
-    if (!reserveOp) {
-      mlir::emitError(symbol.getLoc())
-          << "resolveSymbols: value is not the result of a "
-             "ktdf.tiling.reserve_size";
-      return failure();
-    }
-    int64_t minValue = reserveOp.getMinValue().getSExtValue();
-    int64_t divisibility = reserveOp.getDivisibility().getSExtValue();
-    if (value < minValue) {
-      reserveOp.emitError() << "resolveSymbols: value " << value
-                            << " is below the symbol's min_value " << minValue;
-      return failure();
-    }
-    if (divisibility > 1 && value % divisibility != 0) {
-      reserveOp.emitError()
-          << "resolveSymbols: value " << value
-          << " is not divisible by the symbol's divisibility " << divisibility;
-      return failure();
-    }
-    resolved.push_back({reserveOp, value});
-  }
-
-  // Step 2: Replace each symbol with a constant.
-  for (auto [reserveOp, value] : resolved) {
-    OpBuilder builder(reserveOp);
-    Value constant =
-        arith::ConstantIndexOp::create(builder, reserveOp.getLoc(), value);
-    reserveOp.getResult().replaceAllUsesWith(constant);
-    reserveOp.erase();
-  }
-
-#ifdef DEBUG_LOOP_TILING
-  llvm::outs() << "[LoopReorderingAndTiling] Resolved " << resolved.size()
-               << " symbol(s).\n";
-  llvm::outs().flush();
-#endif
-  return success();
-}
-
-// ---------------------------------------------------------------------------
-
-/// Test input for resolveSymbols(). Every tile size is 2, and every candidate
-/// set keeps its original loop order, i.e. positions[d] = d.
-static llvm::DenseMap<Value, int64_t> makeTestSymbolValues(
-    ArrayRef<SymbolizedSetInfo> symbolizedSets, Operation* root) {
-  llvm::DenseMap<Value, int64_t> symbolValues;
-  for (const SymbolizedSetInfo& set : symbolizedSets)
-    for (auto [depth, position] : llvm::enumerate(set.positions))
-      symbolValues[position] = static_cast<int64_t>(depth);
-
-  // Everything else is a tile size.
-  root->walk([&](mlir::ktdf::TilingReserveSizeOp reserveOp) {
-    symbolValues.try_emplace(reserveOp.getResult(), 2);
-  });
-  return symbolValues;
-}
-
-// ---------------------------------------------------------------------------
-
-struct LoopReorderingAndTilingPass
-    : public scheduler::impl::LoopReorderingAndTilingPassBase<
-          LoopReorderingAndTilingPass> {
-  using LoopReorderingAndTilingPassBase<
-      LoopReorderingAndTilingPass>::LoopReorderingAndTilingPassBase;
+struct SymbolizeLoopOrderAndDataTransferPass
+    : public scheduler::impl::SymbolizeLoopOrderAndDataTransferPassBase<
+          SymbolizeLoopOrderAndDataTransferPass> {
+  using SymbolizeLoopOrderAndDataTransferPassBase<
+      SymbolizeLoopOrderAndDataTransferPass>::
+      SymbolizeLoopOrderAndDataTransferPassBase;
 
   void runOnOperation() override {
     Operation* module = getOperation();
@@ -982,7 +853,8 @@ struct LoopReorderingAndTilingPass
     findCandidateSets(module, candidateSets);
 
 #ifdef DEBUG_LOOP_TILING
-    llvm::outs() << "[LoopReorderingAndTiling] IR after findCandidateSets():\n";
+    llvm::outs()
+        << "[SymbolizeLoopOrderAndDataTransfer] IR after findCandidateSets():\n";
     module->print(llvm::outs());
     llvm::outs() << "\n";
     llvm::outs().flush();
@@ -990,14 +862,14 @@ struct LoopReorderingAndTilingPass
 
 #ifdef DEBUG_LOOP_TILING
     if (candidateSets.empty()) {
-      llvm::outs()
-          << "[LoopReorderingAndTiling] No interchange-candidate loop sets "
-             "found.\n";
+      llvm::outs() << "[SymbolizeLoopOrderAndDataTransfer] No "
+                      "interchange-candidate loop sets found.\n";
       llvm::outs().flush();
       return;
     }
 
-    llvm::outs() << "[LoopReorderingAndTiling] Found " << candidateSets.size()
+    llvm::outs() << "[SymbolizeLoopOrderAndDataTransfer] Found "
+                 << candidateSets.size()
                  << " interchange-candidate loop set(s):";
     for (auto [idx, info] : llvm::enumerate(candidateSets))
       printCandidateSet(static_cast<unsigned>(idx), info.loops, info.pairOps,
@@ -1013,33 +885,12 @@ struct LoopReorderingAndTilingPass
     // Step 3: Make data transfers conditional on the loop ordering, to avoid
     // redundant transfers
     conditionalizeDataTransfers(symbolizedSets, module);
-
-#ifdef DEBUG_LOOP_TILING
-    llvm::outs() << "[LoopReorderingAndTiling] Symbolic IR before "
-                    "resolveSymbols():\n";
-    module->print(llvm::outs());
-    llvm::outs() << "\n";
-    llvm::outs().flush();
-#endif
-
-    // Step 4: Apply values to the symbols. The values are not chosen yet, so
-    // a fixed test input is used for now.
-    llvm::DenseMap<Value, int64_t> symbolValues =
-        makeTestSymbolValues(symbolizedSets, module);
-    if (failed(resolveSymbols(symbolValues))) return signalPassFailure();
-
-    // Step 3(temp): Test reorderLoops by reversing every candidate set.
-    /*for (auto& info : candidateSets) {
-      unsigned n = info.loops.size();
-      SmallVector<unsigned> perm(n);
-      for (unsigned i = 0; i < n; ++i) perm[i] = n - 1 - i;
-      reorderLoops(info.loops, perm);
-    }*/
   }
 };
 
 }  // namespace
 
-std::unique_ptr<mlir::Pass> scheduler::createLoopReorderingAndTilingPass() {
-  return std::make_unique<LoopReorderingAndTilingPass>();
+std::unique_ptr<mlir::Pass>
+scheduler::createSymbolizeLoopOrderAndDataTransferPass() {
+  return std::make_unique<SymbolizeLoopOrderAndDataTransferPass>();
 }
