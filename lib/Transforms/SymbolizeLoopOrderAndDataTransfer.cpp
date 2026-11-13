@@ -28,6 +28,7 @@
 #include <algorithm>
 
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/PipelineScope.h"
+#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Transforms/Utils/Hoisting.h"
 #include "dataflow-scheduler/Transforms/Utils/LoopOrderSymbols.h"
@@ -41,7 +42,6 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
-#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 
 #define PASS_NAME "symbolize-loop-order-and-data-transfer"
 #define DEBUG_LOOP_TILING
@@ -236,8 +236,8 @@ static bool clearAndCheckCandidates(
   return true;
 }
 
-/// Returns the unique directly-nested scf.ForOp inside `loop`, or nullptr.
 static scf::ForOp getUniqueInnerLoop(scf::ForOp loop) {
+  // Returns the unique directly-nested scf.ForOp inside `loop`, or nullptr.
   scf::ForOp inner;
   for (Operation& op : *loop.getBody()) {
     if (auto candidate = dyn_cast<scf::ForOp>(&op)) {
@@ -283,15 +283,14 @@ static void printLoopSummary(scf::ForOp loop, unsigned depth,
 struct CandidateSetInfo {
   SmallVector<scf::ForOp> loops;
   SmallVector<SmallVector<InterleavedOpInfo>>
-      pairOps;  ///< pairOps[i]: between loops[i] and loops[i+1]
+      pairOps;  // pairOps[i]: ops that lie between between loops[i] and
+                // loops[i+1]
 };
 
-/// Returns true if lower bound, upper bound or step of `loop` transitively
-/// depends on the induction variable of any loop in `setLoops`. Such a loop
-/// cannot be reordered with those loops, since its bounds can't be computed
-/// outside of the loop whose IV they use.
 static bool boundsDependOnSetIVs(scf::ForOp loop,
                                  ArrayRef<scf::ForOp> setLoops) {
+  // Returns true if lower bound, upper bound or step of `loop` transitively
+  // depends on the induction variable of any loop in `setLoops`.
   scf::ForOp outermostLoop = setLoops.front();
   Operation* outermost = outermostLoop.getOperation();
   llvm::DenseSet<Value> setIVs;
@@ -345,11 +344,8 @@ static void findCandidateSets(
       // can be added if the set of operations between the current loop and its
       // parent loop is either empty, or fully hoistable and/or sinkable. If
       // hoisting or sinking is needed to add the loop to the current set, then
-      // need to move these ops also.
-      // The child loop cannot join the set if its bounds depend on the IV of
-      // any loop already in the set (e.g. a tail tile size derived from an
-      // outer tile loop's IV), as it could then not be moved outside of that
-      // loop. Check this before moving any ops.
+      // need to move these ops also. Note: the child loop cannot join the set
+      // if its bounds depend on the IV of any loop already in the set.
       SmallVector<InterleavedOpInfo> pairInfo;
       if (!boundsDependOnSetIVs(child_loop, current_set.loops) &&
           clearAndCheckCandidates(current_loop, child_loop, pairInfo)) {
@@ -371,15 +367,14 @@ static void findCandidateSets(
   }
 }
 
-// ---------------------------------------------------------------------------
-
-/// Metadata describing how a candidate set was symbolized.
+// Metadata describing how a candidate set was symbolized.
 struct SymbolizedSetInfo {
-  SmallVector<scf::ForOp> loops;  ///< Physical loops, outermost first.
-  /// positions[d]: index of the original loop that runs at depth d.
-  SmallVector<Value> positions;
-  /// selectedIVs[j]: value standing for the IV of original loop j.
-  SmallVector<Value> selectedIVs;
+  SmallVector<scf::ForOp> loops;   // Candidate set of loops for reordering,
+                                   // arranged outermost to innermost
+  SmallVector<Value> positions;    // positions[d]: index of the original loop
+                                   // that runs at depth d.
+  SmallVector<Value> selectedIVs;  // selectedIVs[j]: value standing for the IV
+                                   // of original loop j.
 };
 
 static SmallVector<SymbolizedSetInfo> symbolizeLoopOrdering(
@@ -425,7 +420,7 @@ static SmallVector<SymbolizedSetInfo> symbolizeLoopOrdering(
       originalUBs.push_back(loop.getUpperBound());
     }
 
-    // Step 2: Create position variables for this candidate set
+    // Step 2: Create position symbols for this candidate set
     SmallVector<Value> positions;
     scf::ForOp firstLoop = loops[0];
     Location loc = firstLoop.getLoc();
@@ -434,8 +429,8 @@ static SmallVector<SymbolizedSetInfo> symbolizeLoopOrdering(
 
     for (unsigned i = 0; i < numLoops; ++i) {
       auto posOp = mlir::ktdf::TilingReserveSizeOp::create(
-          builder, loc, builder.getIndexType(),
-          builder.getIndexAttr(0), builder.getIndexAttr(1));
+          builder, loc, builder.getIndexType(), builder.getIndexAttr(0),
+          builder.getIndexAttr(1));
       // Tag the symbol so that later passes can recognize it.
       posOp->setAttr(scheduler::kLoopOrderDepthAttr, builder.getIndexAttr(i));
       positions.push_back(posOp.getResult());
@@ -443,45 +438,48 @@ static SmallVector<SymbolizedSetInfo> symbolizeLoopOrdering(
 
     candidateSetPositions[&candidateSet] = positions;
 
-    // Step 3: Rewrite loop upper bounds using select chains
-    // Build nested select chain for each position:
-    // For loop at position i: select(pos[i]==0, ub[0], select(pos[i]==1, ub[1], ..., ub[N-1]))
+    // Step 3: Create select chains for the loop upperbound, and rewrite upper
+    // bounds using select chains.
     auto buildSelectChain = [&](Value posVar, ArrayRef<Value> bounds) -> Value {
-      // Start from the end as default, then build the chain forward
+      // Step 3a: Create select chains. For loop at position i:
+      // select(pos[i]==0, ub[0], select(pos[i]==1, ub[1], ..., ub[N-1]))
       Value result = bounds.back();
       for (int i = static_cast<int>(bounds.size()) - 2; i >= 0; --i) {
         Value bound = bounds[i];
         Value indexConst = arith::ConstantOp::create(
             builder, loc, builder.getIndexType(), builder.getIndexAttr(i));
-        Value cond = arith::CmpIOp::create(
-            builder, loc, arith::CmpIPredicate::eq, posVar, indexConst).getResult();
-        // select(posVar==i, bounds[i], result_from_previous_iteration)
+        Value cond =
+            arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::eq,
+                                  posVar, indexConst)
+                .getResult();
         result = arith::SelectOp::create(builder, loc, cond, bound, result);
       }
       return result;
     };
 
-    // Apply to all loops - each loop's upper bound uses its corresponding position variable
+    // Step 3b: Apply select chains to upper bounds - each loop's upper bound
+    // uses its corresponding position variable. Lower bound and step
+    // remain 0 and 1 respectively (unchanged)
     for (unsigned loopIdx = 0; loopIdx < numLoops; ++loopIdx) {
       Value newUB = buildSelectChain(positions[loopIdx], originalUBs);
-
       scf::ForOp loop = loops[loopIdx];
       loop.setUpperBound(newUB);
-      // Lower bound and step remain 0 and 1 respectively (unchanged)
     }
 
-    // Step 4: Insert arg selection trees in the innermost loop body
-    // For perfectly nested loops, all IVs are accessible in the innermost body.
-    // For each original loop, create a select chain that picks its IV.
+    // Step 4: Create selection chains for loop IVs, and replace all uses of IVs
+    // in the loop body with the corresponding value from selection chain.
+    // Insert arg selection trees in the innermost loop body
     scf::ForOp innermostLoop = loops[numLoops - 1];
-    OpBuilder bodyBuilder(innermostLoop.getBody(), innermostLoop.getBody()->begin());
+    OpBuilder bodyBuilder(innermostLoop.getBody(),
+                          innermostLoop.getBody()->begin());
 
     SmallVector<Value> selectedIVs(numLoops);
     llvm::DenseSet<Operation*> selectionTreeOps;
 
-    // positions[d] holds the index of the original loop that runs at depth d
-    // (see the upper bound select chains above). The IV of original loop j is
-    // therefore the IV of the depth d for which positions[d] == j.
+    // Step 4a: Create IV selection chains. positions[d] holds the index of the
+    // original loop that runs at depth d (see the upper bound select chains
+    // above). The IV of original loop j is therefore the IV of the depth d for
+    // which positions[d] == j.
     for (unsigned origLoopIdx = 0; origLoopIdx < numLoops; ++origLoopIdx) {
       scf::ForOp lastLoop = loops[numLoops - 1];
       Value selectedIV = lastLoop.getInductionVar();
@@ -493,20 +491,21 @@ static SmallVector<SymbolizedSetInfo> symbolizeLoopOrdering(
         scf::ForOp iLoop = loops[i];
         Value iv = iLoop.getInductionVar();
 
-        Value cond = arith::CmpIOp::create(
-            bodyBuilder, loc, arith::CmpIPredicate::eq, positions[i],
-            indexConst).getResult();
+        Value cond =
+            arith::CmpIOp::create(bodyBuilder, loc, arith::CmpIPredicate::eq,
+                                  positions[i], indexConst)
+                .getResult();
         selectionTreeOps.insert(cond.getDefiningOp());
 
-        selectedIV = arith::SelectOp::create(bodyBuilder, loc, cond, iv,
-                                             selectedIV);
+        selectedIV =
+            arith::SelectOp::create(bodyBuilder, loc, cond, iv, selectedIV);
         selectionTreeOps.insert(selectedIV.getDefiningOp());
       }
       selectedIVs[origLoopIdx] = selectedIV;
     }
 
-    // Step 5: Replace uses of original loop IVs with selected IVs
-    // Skip uses in selection tree ops and loop definitions
+    // Step 4b: Replace uses of original loop IVs with selected IVs (kip uses in
+    // selection tree ops and loop definitions)
     llvm::DenseSet<Operation*> loopDefOps;
     for (unsigned i = 0; i < numLoops; ++i) {
       scf::ForOp loop = loops[i];
@@ -514,7 +513,8 @@ static SmallVector<SymbolizedSetInfo> symbolizeLoopOrdering(
     }
 
     innermostLoop.getBody()->walk([&](Operation* op) {
-      // Skip if this operation is part of selection trees or is a loop definition
+      // Skip if this operation is part of selection trees or is a loop
+      // definition
       if (selectionTreeOps.count(op) || loopDefOps.count(op)) return;
       if (isa<scf::YieldOp>(op)) return;
       // The operands of buffer_phase are the loops of the pipeline scope in
@@ -541,21 +541,14 @@ static SmallVector<SymbolizedSetInfo> symbolizeLoopOrdering(
   return symbolizedSets;
 }
 
-// ---------------------------------------------------------------------------
-
-/// Collects what the data in `transfer` depends on, by following the operands
-/// of the transfer back to the loop induction variables they are computed from.
-///   - `staticLoops`: loops whose raw IV is reached.
-///   - `setDeps`: (set index, original loop index) pairs, reached through the
-///     selected IVs of a symbolized candidate set.
-/// Values coming from ktdf.select_memref are not followed, since they select
-/// the double buffer, which is accounted for separately. Returns false if the
-/// dependences cannot be determined.
 static bool collectTransferDeps(
     mlir::ktdf::DataTransferOp transfer, ArrayRef<scf::ForOp> chain,
     const llvm::DenseMap<Value, std::pair<unsigned, unsigned>>& selectedIVMap,
     llvm::DenseSet<Operation*>& staticLoops,
     llvm::DenseSet<std::pair<unsigned, unsigned>>& setDeps) {
+  // Collects what the data in `transfer` depends on, by following the operands
+  // of the transfer back to the loop induction variables they are computed
+  // from.
   scf::ForOp outermostLoop = chain.front();
   Operation* outermost = outermostLoop.getOperation();
   llvm::DenseSet<Operation*> chainOps;
@@ -581,14 +574,12 @@ static bool collectTransferDeps(
         staticLoops.insert(owner);
         continue;
       }
-      // Arguments of other regions inside the loop nest are not understood.
       if (outermost->isProperAncestor(owner)) return false;
       continue;
     }
 
     Operation* defOp = val.getDefiningOp();
     if (isa<mlir::ktdf::SelectMemrefOp>(defOp)) continue;
-    // Defined outside of the loop nest, so independent of every loop.
     if (!outermost->isProperAncestor(defOp)) continue;
     if (defOp->getNumRegions() != 0) return false;
     if (!visited.insert(defOp).second) continue;
@@ -597,22 +588,22 @@ static bool collectTransferDeps(
   return true;
 }
 
-/// Wraps `transfer` in an scf.if so that it only runs when it is not redundant
-/// for the current loop ordering. See conditionalizeDataTransfers().
 static bool conditionalizeTransfer(
     mlir::ktdf::DataTransferOp transfer,
     ArrayRef<SymbolizedSetInfo> symbolizedSets,
     const llvm::DenseMap<Value, std::pair<unsigned, unsigned>>& selectedIVMap,
     const llvm::DenseMap<Operation*, std::pair<unsigned, unsigned>>&
         loopSetInfo) {
-  // Only transfers between global and ct_local memory are handled: loads
-  // (global -> ct_local) and stores (ct_local -> global).
+  // Step 1: Only transfers between global and ct_local memory -- loads (global
+  // -> ct_local) and stores (ct_local -> global) -- are allowed to be
+  // conditionalized. Check if the current data transfer is a global <-> local
+  // transfer
   auto getMemorySpaceKind =
       [](Value v) -> std::optional<mlir::ktdp::MemorySpaceKind> {
     auto memrefType = dyn_cast<MemRefType>(v.getType());
     if (!memrefType) return std::nullopt;
-    auto space =
-        dyn_cast_or_null<mlir::ktdp::MemorySpaceAttr>(memrefType.getMemorySpace());
+    auto space = dyn_cast_or_null<mlir::ktdp::MemorySpaceAttr>(
+        memrefType.getMemorySpace());
     if (!space) return std::nullopt;
     return space.getKind();
   };
@@ -630,8 +621,7 @@ static bool conditionalizeTransfer(
   auto pipeline = dyn_cast<mlir::ktdf::PipelineOp>(stage->getParentOp());
   if (!pipeline) return false;
 
-  // Step 1: Find the loops the transfer is inside of (outermost first). Other
-  // kinds of loops are not understood.
+  // Step 2: Find the loops the transfer is inside of (outermost first).
   SmallVector<scf::ForOp> chain;
   for (Operation* p = transfer->getParentOp(); p; p = p->getParentOp()) {
     if (auto forOp = dyn_cast<scf::ForOp>(p))
@@ -647,15 +637,16 @@ static bool conditionalizeTransfer(
       return false;
   unsigned n = chain.size();
 
-  // Step 2: Find which loops the transfer depends on.
+  // Step 2: Find which loops the transfer depends on. If the transfer contains
+  // the IV of a loop in its body, then it depends on that loop and vice-versa
   llvm::DenseSet<Operation*> staticLoops;
   llvm::DenseSet<std::pair<unsigned, unsigned>> setDeps;
   if (!collectTransferDeps(transfer, chain, selectedIVMap, staticLoops,
                            setDeps))
     return false;
 
-  // A transfer that depends on every enclosing loop is never redundant, for
-  // any loop ordering, so there is nothing to guard.
+  // Step 2a: A transfer that depends on every enclosing loop is never
+  // redundant, for any loop ordering, so there is nothing to guard.
   bool dependsOnAllLoops = true;
   for (scf::ForOp loop : chain) {
     if (staticLoops.count(loop.getOperation())) continue;
@@ -671,12 +662,17 @@ static bool conditionalizeTransfer(
   }
   if (dependsOnAllLoops) return false;
 
-  // Loops enclosing the pipeline whose IVs select the double buffer.
+  // Step 2b: Hoisting outside loops present inside a pipeline with modulo > 1
+  // requires special handling to ensure all instances are correctly filled.
+  // Collect loops enclosing the pipeline whose IVs select the double buffer.
   llvm::DenseSet<Operation*> scopeLoops;
   for (scf::ForOp loop : mlir::ktdf::getPipelineEnclosingScope(pipeline).loops)
     scopeLoops.insert(loop.getOperation());
-  uint64_t numPhases = pipeline.getModulo().value_or(1);
 
+  // Step 3: For each physical loop, build a condition that is true if the
+  // transfer depends on that loop. For loops in a symbolized set, this is true
+  // if the transfer depends on the original loop placed at that depth.
+  uint64_t numPhases = pipeline.getModulo().value_or(1);
   OpBuilder b(transfer);
   Location loc = transfer.getLoc();
   auto idx = [&](int64_t v) -> Value {
@@ -698,9 +694,6 @@ static bool conditionalizeTransfer(
   Value trueV = boolConst(true);
   Value falseV = boolConst(false);
 
-  // Step 3: For each physical loop, build a condition that is true if the
-  // transfer depends on that loop. For loops in a symbolized set, this is true
-  // if the transfer depends on the original loop placed at that depth.
   SmallVector<Value> dep(n, falseV);
   for (unsigned i = 0; i < n; ++i) {
     Operation* loopOp = chain[i].getOperation();
@@ -718,16 +711,10 @@ static bool conditionalizeTransfer(
                                  idx(origLoop)));
   }
 
-  // Step 4: A loop that the transfer does not depend on only needs to repeat
-  // the transfer if the transfer depends on a loop nested inside of it, since
-  // that inner loop then changes what is transferred in every iteration.
-  // suffixDep[i] is true if the transfer depends on loop i or any inner loop.
-  // Loops inside the stage are swept completely by every execution of the
-  // stage, and the buffer holds the whole sweep, so a dependence on a loop
-  // inside the stage does not force the loops outside of it to repeat the
-  // transfer. For these loops suffixDep[i] is just whether the transfer depends
-  // on loop i itself. Loops outside of the pipeline's scope are not understood,
-  // so they always repeat it.
+  // Step 4: Find if the transfers can be hoisted outside some of its
+  // encompassing loops. Note: transfers will be hoisted only upto the innermost
+  // dependent loop. suffixDep[i] is true if the transfer depends on loop i or
+  // any inner loop.
   SmallVector<Value> suffixDep(n);
   Value accScope = falseV;
   for (int i = static_cast<int>(n) - 1; i >= 0; --i) {
@@ -743,14 +730,11 @@ static bool conditionalizeTransfer(
   }
 
   // Step 5: Build the condition under which the transfer must run. Loops with
-  // suffixDep false are the ones the transfer is redundant across.
-  //   - Loads: only the first iteration of those loops is needed. If the
-  //     pipeline is double buffered, the first `numPhases` iterations of the
-  //     loops that select the buffer are needed, so that every buffer is
-  //     filled. These iterations are counted over the flattened iteration
-  //     space of those loops.
-  //   - Stores: only the last iteration of those loops is needed, since it
-  //     holds the final value.
+  // suffixDep false are the ones the transfer is redundant across. (1) Loads:
+  // only the first iteration of those loops is needed. If the pipeline is
+  // double buffered, the first `numPhases` iterations of the loops that select
+  // the buffer are needed, so that every buffer is filled. (2) Stores: only the
+  // last iteration of those loops is needed, since it holds the final value.
   Value cond = trueV;
   if (isLoad) {
     Value zero = idx(0);
@@ -759,15 +743,15 @@ static bool conditionalizeTransfer(
     for (int i = static_cast<int>(n) - 1; i >= 0; --i) {
       Value iv = chain[i].getInductionVar();
       if (numPhases <= 1 || !scopeLoops.count(chain[i].getOperation())) {
-        cond = andI(cond, orI(suffixDep[i], cmp(arith::CmpIPredicate::eq, iv,
-                                                zero)));
+        cond = andI(cond,
+                    orI(suffixDep[i], cmp(arith::CmpIPredicate::eq, iv, zero)));
         continue;
       }
       Value inFlat = b.createOrFold<arith::XOrIOp>(loc, suffixDep[i], trueV);
       Value newIdx = b.createOrFold<arith::AddIOp>(
           loc, flatIdx, b.createOrFold<arith::MulIOp>(loc, iv, flatSize));
-      Value newSize = b.createOrFold<arith::MulIOp>(
-          loc, flatSize, chain[i].getUpperBound());
+      Value newSize = b.createOrFold<arith::MulIOp>(loc, flatSize,
+                                                    chain[i].getUpperBound());
       flatIdx = b.createOrFold<arith::SelectOp>(loc, inFlat, newIdx, flatIdx);
       flatSize =
           b.createOrFold<arith::SelectOp>(loc, inFlat, newSize, flatSize);
@@ -778,15 +762,15 @@ static bool conditionalizeTransfer(
   } else {
     Value one = idx(1);
     for (int i = static_cast<int>(n) - 1; i >= 0; --i) {
-      Value last = b.createOrFold<arith::SubIOp>(
-          loc, chain[i].getUpperBound(), one);
-      cond = andI(cond,
-                  orI(suffixDep[i], cmp(arith::CmpIPredicate::eq,
-                                        chain[i].getInductionVar(), last)));
+      Value last =
+          b.createOrFold<arith::SubIOp>(loc, chain[i].getUpperBound(), one);
+      cond =
+          andI(cond, orI(suffixDep[i], cmp(arith::CmpIPredicate::eq,
+                                           chain[i].getInductionVar(), last)));
     }
   }
 
-  // Step 6: Guard the transfer with the condition, unless it always holds.
+  // Step 6: Add the condition around the transfer
   if (matchPattern(cond, m_One())) return false;
   auto ifOp = scf::IfOp::create(b, loc, TypeRange{}, cond,
                                 /*withElseRegion=*/false);
@@ -794,15 +778,9 @@ static bool conditionalizeTransfer(
   return true;
 }
 
-/// Makes the data transfers in the L3 load/store unit stages conditional on
-/// the loop ordering, to avoid redundant transfers. A transfer that does not
-/// depend on a loop only needs to run in the first iteration of that loop
-/// (last iteration for stores), provided no loop that the transfer depends on
-/// is nested inside of it. Since the loop ordering inside a candidate set is
-/// still symbolic, these conditions are written in terms of the position
-/// variables of the set.
 static void conditionalizeDataTransfers(
     ArrayRef<SymbolizedSetInfo> symbolizedSets, Operation* root) {
+  // Step 1: Identify all data transfers and collect necessary metadata
   llvm::DenseMap<Value, std::pair<unsigned, unsigned>> selectedIVMap;
   llvm::DenseMap<Operation*, std::pair<unsigned, unsigned>> loopSetInfo;
   for (unsigned s = 0; s < symbolizedSets.size(); ++s) {
@@ -816,9 +794,12 @@ static void conditionalizeDataTransfers(
   }
 
   SmallVector<mlir::ktdf::DataTransferOp> transfers;
-  root->walk(
-      [&](mlir::ktdf::DataTransferOp transfer) { transfers.push_back(transfer); });
+  root->walk([&](mlir::ktdf::DataTransferOp transfer) {
+    transfers.push_back(transfer);
+  });
 
+  // Step 2: Check if each data transfer can be conditionalized. If yes, put in
+  // the correct condition to avoid redundant transfers
   unsigned numConditionalized = 0;
   for (mlir::ktdf::DataTransferOp transfer : transfers)
     if (conditionalizeTransfer(transfer, symbolizedSets, selectedIVMap,
@@ -833,8 +814,6 @@ static void conditionalizeDataTransfers(
 #endif
   (void)numConditionalized;
 }
-
-// ---------------------------------------------------------------------------
 
 struct SymbolizeLoopOrderAndDataTransferPass
     : public scheduler::impl::SymbolizeLoopOrderAndDataTransferPassBase<
@@ -853,8 +832,8 @@ struct SymbolizeLoopOrderAndDataTransferPass
     findCandidateSets(module, candidateSets);
 
 #ifdef DEBUG_LOOP_TILING
-    llvm::outs()
-        << "[SymbolizeLoopOrderAndDataTransfer] IR after findCandidateSets():\n";
+    llvm::outs() << "[SymbolizeLoopOrderAndDataTransfer] IR after "
+                    "findCandidateSets():\n";
     module->print(llvm::outs());
     llvm::outs() << "\n";
     llvm::outs().flush();

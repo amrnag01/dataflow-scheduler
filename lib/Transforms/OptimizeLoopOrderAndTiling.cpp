@@ -44,16 +44,14 @@ namespace scheduler {
 
 namespace {
 
-/// Applies values to symbols in the IR. Each key of `symbolValues` must be the
-/// result of a ktdf.tiling.reserve_size op (a tile size or a loop position
-/// created by -symbolize-loop-order-and-data-transfer). It is replaced with an
-/// index constant holding the given value, and the reserve_size op is erased.
-/// Fails, leaving the IR unchanged, if a key is not such a result or its value
-/// violates the min_value or divisibility of the symbol.
 static LogicalResult resolveSymbols(
     const llvm::DenseMap<Value, int64_t>& symbolValues) {
-  // Step 1: Check every symbol before changing anything.
+  // Applies values to symbols in the IR. Each key of `symbolValues` must be the
+  // result of a ktdf.tiling.reserve_size op (a tile size or a loop position
+  // created by -symbolize-loop-order-and-data-transfer). It is replaced with an
+  // index constant holding the given value, and the reserve_size op is erased.
   SmallVector<std::pair<mlir::ktdf::TilingReserveSizeOp, int64_t>> resolved;
+  // Step 1: Check every symbol before changing anything.
   for (auto [symbol, value] : symbolValues) {
     auto reserveOp = symbol.getDefiningOp<mlir::ktdf::TilingReserveSizeOp>();
     if (!reserveOp) {
@@ -89,11 +87,10 @@ static LogicalResult resolveSymbols(
   return success();
 }
 
-// ---------------------------------------------------------------------------
-
-/// Test input for resolveSymbols(). Every tile size is 2, and every candidate
-/// set keeps its original loop order, i.e. positions[d] = d.
 static llvm::DenseMap<Value, int64_t> makeTestSymbolValues(Operation* root) {
+  // [TEMP FUNCTION] Generate a test input for resolveSymbols(). Every tile size
+  // is 2, and every candidate set keeps its original loop order, i.e.
+  // positions[d] = d.
   llvm::DenseMap<Value, int64_t> symbolValues;
   root->walk([&](mlir::ktdf::TilingReserveSizeOp reserveOp) {
     // Loop position symbols are tagged with their depth in the candidate set.
@@ -105,8 +102,6 @@ static llvm::DenseMap<Value, int64_t> makeTestSymbolValues(Operation* root) {
   });
   return symbolValues;
 }
-
-// ---------------------------------------------------------------------------
 
 struct OptimizeLoopOrderAndTilingPass
     : public scheduler::impl::OptimizeLoopOrderAndTilingPassBase<
